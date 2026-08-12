@@ -1,0 +1,6 @@
+numpy>=1.26,<2.0
+pandas>=2.0
+torch>=2.1
+torch-geometric>=2.3
+tqdm>=4.60
+scikit-learn>=1.3
