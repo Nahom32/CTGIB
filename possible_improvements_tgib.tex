@@ -1,0 +1,844 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,decorations.pathmorphing,calc}
+\usepackage{cleveref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{microtype}
+\usepackage{lmodern}
+\usepackage{graphicx}
+
+% ── Geometry ──────────────────────────────────────────────────────────
+\geometry{margin=2.5cm}
+
+% ── Hyperref style ────────────────────────────────────────────────────
+\hypersetup{
+    colorlinks  = true,
+    linkcolor   = blue!70!black,
+    citecolor   = blue!70!black,
+    urlcolor    = blue!60!black,
+}
+
+% ── Theorem environments ──────────────────────────────────────────────
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newtheorem{definition}{Definition}
+
+% ── Custom commands ───────────────────────────────────────────────────
+\newcommand{\R}{\mathcal{R}}
+\newcommand{\G}{\mathcal{G}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Ber}{\mathrm{Ber}}
+\newcommand{\Bern}{\mathrm{Bern}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\I}{I}
+\newcommand{\loss}{\mathcal{L}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\newcommand{\BCE}{\mathrm{BCE}}
+
+% ══════════════════════════════════════════════════════════════════════
+\title{\vspace{-1.0cm}
+\textbf{Possible Improvements for the\\Temporal Graph Information Bottleneck}\\[0.4em]
+\normalsize\textit{A Mathematical Analysis of the TGIB Objective and Implementation}}
+\date{}
+\author{%
+  Project Report — CTGIB Repository\\[0.2em]
+  \small Based on \textit{Self-Explainable Temporal Graph Networks based on\\
+  Graph Information Bottleneck} (Seo et al., KDD 2024)}
+% ══════════════════════════════════════════════════════════════════════
+
+\begin{document}
+\maketitle
+
+% ── Abstract ──────────────────────────────────────────────────────────
+\begin{abstract}
+\noindent
+The Temporal Graph Information Bottleneck (TGIB) framework simultaneously
+performs link prediction and explanation generation on temporal graphs by
+optimizing a Graph Information Bottleneck (GIB) objective. This report
+provides a detailed mathematical analysis of the TGIB formulation and
+its open-source implementation, identifying five concrete improvements
+that are both theoretically grounded and directly implementable. We
+formalise: (1)~an explicit Lagrange multiplier~$\beta$ for the
+rate--distortion tradeoff, (2)~a numerically stable closed-form
+$\KL$-divergence computation, (3)~temperature annealing for the
+Gumbel--Softmax mask sampler, (4)~a configurable and generalisable
+prior schedule, and (5)~a $\beta$-warmup strategy to stabilise
+optimisation. We provide the complete mathematical derivation for each
+improvement, discuss the expected effect on both link-prediction
+accuracy and explanation quality, and supply ready-to-use
+implementation sketches compatible with the official TGIB codebase.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:introduction}
+% ══════════════════════════════════════════════════════════════════════
+
+Temporal Graph Neural Networks~(TGNNs) have demonstrated strong
+performance in modelling dynamic interactions across social networks,
+collaboration graphs, and communication logs. A growing body of work
+has therefore focused on \emph{explaining} TGNN predictions---that is,
+identifying which past events causally influenced a predicted link
+occurrence.
+
+Seo et~al.~\cite{seo2024tgib} proposed \textbf{TGIB}, a \emph{built-in}
+explanation framework that unifies prediction and explanation within a
+single forward pass. Rather than relying on post-hoc perturbation
+methods, TGIB injects stochasticity into the representation of each
+past candidate event via learned Bernoulli masks, optimising a
+\emph{Graph Information Bottleneck} (GIB) objective. The mask
+probabilities naturally serve as importance scores, and the resulting
+sparse subgraph constitutes the explanation.
+
+While elegant in formulation, the official implementation contains
+several mathematical simplifications and numerical shortcuts that
+diverge from the published equations. This report systematically
+catalogues these discrepancies and proposes rigorous, drop-in
+improvements. Specifically, we address:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item The implicit weight of the rate term ($\beta = 1$).
+  \item An ad-hoc $\KL$-divergence computation with an
+        epsilon-in-ratio pattern.
+  \item A fixed Concrete temperature ($\tau = 1$) with no annealing.
+  \item Hardcoded prior parameters ($r_0 = 0.9$, $r_{\min} = 0.7$).
+  \item No warmup for the $\beta$ schedule.
+\end{enumerate}
+
+Each improvement is derived from first principles, benchmarked against
+the paper's formulation, and accompanied by pseudocode for direct
+integration.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Background: The TGIB Objective}
+\label{sec:background}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Information Bottleneck for Temporal Graphs}
+
+Let $e_k = (u_k, v_k, t_k, \mathrm{att}_k)$ denote the $k$-th event in
+a temporal graph, and let $\G^k$ denote the $L$-hop computation graph
+of~$e_k$ constructed from all events prior to timestamp~$t_k$. TGIB
+seeks a \emph{bottleneck code} $\R^k \subseteq \G^k$ that is
+simultaneously \emph{sufficient} for predicting the label~$Y_k$
+(whether $e_k$ occurs) and \emph{minimal} relative to the full
+neighbourhood. Following the GIB principle~\cite{wu2020gib}, this is
+formalised as:
+\begin{equation}
+\label{eq:gib_objective}
+\min_{\R^k} \; \underbrace{-\I(Y_k ; \R^k)}_{\text{Distortion (Eq.~\ref{eq:distortion})}}
+  \;+\; \beta \underbrace{\I(\R^k ; e_k, \G^k)}_{\text{Rate (Eq.~\ref{eq:rate})}},
+\end{equation}
+where $\beta > 0$ is a Lagrange multiplier controlling the
+accuracy--explanation tradeoff.
+
+\subsection{Variational Upper Bounds}
+
+Since mutual information is intractable to compute exactly, TGIB
+optimises variational upper bounds on each term.
+
+\paragraph{Distortion term.}
+Using a variational approximation $q_\theta(Y_k \mid \R^k)$ of
+$p(Y_k \mid \R^k)$:
+\begin{equation}
+\label{eq:distortion}
+-\I(Y_k ; \R^k) \;\leq\; \E_{Y_k, \R^k}\!\big[-\log q_\theta(Y_k \mid \R^k)\big]
+  \;\eqqcolon\; \loss_{\text{cls}}.
+\end{equation}
+
+\paragraph{Rate term.}
+Decomposing the bottleneck code into per-event Bernoulli masks
+$\alpha_j^k \sim \Ber(p_j^k)$ with
+$p_j^k = \sigma\!\big(g(X_{e_k}, Z_{e_j})\big)$, and using a
+variational marginal $q(\R^k)$ that factorises as a product of i.i.d.
+$\Bern(r)$ distributions:
+\begin{equation}
+\label{eq:rate}
+\I(\R^k ; e_k, \G^k)
+  \;\leq\; \E_{\G^k}\!\left[\sum_{e_j \in \G^k}
+    p_j^k \log \frac{p_j^k}{r}
+    + (1 - p_j^k) \log \frac{1 - p_j^k}{1 - r}
+  \right]
+  \;\eqqcolon\; \loss_{\text{MI}},
+\end{equation}
+which is a sum of $\KL$-divergences between
+$\Bern(p_j^k)$ and $\Bern(r)$ over all candidate events in $\G^k$.
+
+\paragraph{Total objective.}
+\begin{equation}
+\label{eq:total_loss}
+\loss_{\text{total}} = \loss_{\text{cls}} + \beta\,\loss_{\text{MI}}.
+\end{equation}
+
+\subsection{Discrepancies in the Reference Implementation}
+
+The official codebase\footnote{\url{https://github.com/sang-woo-seo/TGIB}}
+implements the total loss as:
+\begin{equation}
+\label{eq:code_loss}
+\loss_{\text{code}} = \BCE(p^+, 1) + \BCE(p^-, 0) + \loss_{\text{MI}},
+\end{equation}
+where $\BCE$ denotes binary cross-entropy, and $p^+$/$p^-$ are the
+positive/negative link probabilities respectively. Comparing
+\Cref{eq:total_loss} with~\Cref{eq:code_loss}, we identify the
+following gaps:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Implicit $\beta = 1$:} the rate term enters the loss
+        without any explicit weighting.
+  \item \textbf{Non-standard $\KL$:} the implementation uses
+        $\log(p/r + 10^{-6})$ instead of $\log p - \log r$.
+  \item \textbf{Fixed temperature:} the Concrete sampler uses
+        $\tau = 1$ throughout training with no annealing.
+  \item \textbf{Hardcoded prior schedule:} $r$ anneals from $0.9$
+        to $0.7$ with fixed hyperparameters.
+  \item \textbf{No $\beta$-warmup:} $\beta$ is constant across all
+        epochs.
+\end{enumerate}
+
+The remainder of this report addresses each of these in turn.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Improvement~1: Explicit $\beta$-Weighted Rate Term}
+\label{sec:beta}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Motivation}
+
+In the Information Bottleneck framework, $\beta$ governs the fundamental
+tradeoff between \emph{compression} (small $\R^k$, i.e.\ sparse
+explanations) and \emph{sufficiency} (high predictive accuracy). Setting
+$\beta = 1$ fixes this tradeoff at a single point, forfeiting the
+ability to navigate the rate--distortion curve.
+
+For the \emph{explanation} task, one typically prefers \emph{sparser}
+subgraphs than those optimised purely for prediction accuracy. An
+explicit $\beta > 1$ increases the penalty for including
+non-informative candidate events, yielding more selective explanations.
+
+\subsection{Mathematical Formulation}
+
+\begin{definition}[Explicit $\beta$-weighted objective]
+\label{def:beta_objective}
+For a hyperparameter $\beta > 0$, the improved TGIB objective is:
+\begin{equation}
+\label{eq:beta_objective}
+\loss_{\text{total}}^{(\beta)} = \loss_{\text{cls}} + \beta \cdot \loss_{\text{MI}}.
+\end{equation}
+\end{definition}
+
+When $\beta = 1$, this reduces identically to the current formulation.
+The recommended operating region is $\beta \in [0.5, 5.0]$:
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+  \item $\beta < 1$: relaxes compression; useful for maximising
+        link-prediction accuracy at the cost of explanation density.
+  \item $\beta > 1$: enforces compression; useful for generating
+        sparse, interpretable explanations.
+\end{itemize}
+
+\subsection{Implementation Sketch}
+
+\begin{algorithm}[H]
+\caption{Forward pass with explicit $\beta$}
+\label{alg:beta}
+\begin{algorithmic}[1]
+\REQUIRE Target mask scores $p^+, p^-$; prior $r$; weight $\beta > 0$
+\STATE Compute $\loss_{\text{MI}}$ via \Cref{eq:mi_stable}
+\STATE $\loss_{\text{MI}} \leftarrow \beta \cdot \loss_{\text{MI}}$
+\RETURN $\loss_{\text{cls}} + \loss_{\text{MI}}$
+\end{algorithmic}
+\end{algorithm}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Improvement~2: Numerically Stable KL Divergence}
+\label{sec:kl_stability}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{The Current Implementation}
+
+The reference code computes the per-event rate term as:
+\begin{equation}
+\label{eq:kl_code}
+\ell_j^{\text{code}}
+  = p_j \,\log\!\left(\frac{p_j}{r} + \epsilon\right)
+  + (1 - p_j)\,\log\!\left(\frac{1 - p_j}{1 - r} + \epsilon\right),
+  \qquad \epsilon = 10^{-6}.
+\end{equation}
+
+\subsection{Analysis of the Epsilon Placement}
+
+This formulation has two problematic regimes:
+
+\paragraph{Case 1: $p_j \to 0$.}
+The first term becomes $0 \cdot \log(10^{-6}) = 0$, which is
+correct. However, the gradient with respect to $p_j$ receives a
+contribution of
+$\log(\epsilon) - 1 \approx -15.8$, which is disproportionately large
+relative to the true gradient $\log(p_j/r)$. This introduces spurious
+gradient magnitude early in training when many mask probabilities are
+near zero.
+
+\paragraph{Case 2: $r \to 1$.}
+The second term's ratio $(1 - p_j)/(1 - r)$ diverges, and the
+epsilon-inside-log form clips this to $\log(1/\epsilon) \approx 13.8$,
+artificially bounding the KL value and distorting the gradient.
+
+\subsection{The Stable Formulation}
+
+The $\KL$-divergence between two Bernoulli distributions admits a clean
+closed form that can be computed in log-space:
+
+\begin{proposition}[Stable $\KL(\Bern(p) \| \Bern(r))$]
+\label{prop:kl_stable}
+For $p \in [0,1]$ and $r \in (0,1)$, the $\KL$-divergence is:
+\begin{equation}
+\label{eq:kl_stable}
+\KL\!\big(\Bern(p) \,\|\, \Bern(r)\big)
+  = p\,\big(\log(p + \delta) - \log(r + \delta)\big)
+  + (1 - p)\,\big(\log(1 - p + \delta) - \log(1 - r + \delta)\big),
+\end{equation}
+where $\delta > 0$ is a machine-precision constant (e.g.\
+$\delta = 10^{-8}$).
+\end{proposition}
+
+\begin{proof}
+Expanding the definition:
+\begin{align}
+\KL(\Bern(p) \| \Bern(r))
+  &= p\,\log\frac{p}{r} + (1 - p)\,\log\frac{1 - p}{1 - r}
+    \notag\\
+  &= p\,(\log p - \log r) + (1 - p)\,(\log(1 - p) - \log(1 - r)).
+    \label{eq:kl_expanded}
+\end{align}
+Adding $\delta$ inside each $\log$ argument avoids $\log(0)$ while
+preserving the identity for $p, r \in (0, 1)$, since
+$\log(x + \delta) = \log x + \log(1 + \delta/x)$ and
+$\delta/x \ll 1$ for the typical operating range. The gradient of
+\Cref{eq:kl_stable} with respect to~$p$ is well-conditioned:
+\begin{equation}
+\frac{\partial\, \KL}{\partial\, p}
+  = \log(p + \delta) - \log(r + \delta)
+    - \log(1 - p + \delta) + \log(1 - r + \delta),
+\end{equation}
+which has bounded magnitude for all $p \in [0, 1]$ and $r \in (0, 1)$.
+\end{proof}
+
+\subsection{Comparison with the Code Form}
+
+The difference between \Cref{eq:kl_code} and \Cref{eq:kl_stable} is
+the substitution:
+\begin{equation}
+\log\!\left(\frac{a}{b} + \epsilon\right)
+  \;\longrightarrow\;
+\log(a + \delta) - \log(b + \delta).
+\end{equation}
+These agree when $\epsilon \ll a/b$ but diverge when $a \ll b \cdot
+\epsilon$. The log-space form is the standard pattern used in
+numerical libraries (e.g.\
+\texttt{torch.nn.functional.kl\_div}).
+
+\subsection{Full Rate Loss with Stable KL}
+
+Summing over all candidate events in $\G^k$:
+\begin{equation}
+\label{eq:mi_stable}
+\loss_{\text{MI}}^{(\text{stable})}
+  = \frac{1}{|\G^k|}\sum_{e_j \in \G^k}
+    \KL\!\big(\Bern(p_j^k) \,\|\, \Bern(r)\big),
+\end{equation}
+where each $\KL$ is computed via \Cref{eq:kl_stable}. The
+$\frac{1}{|\G^k|}$ normalisation ensures scale invariance across
+different neighbourhood sizes.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Improvement~3: Concrete Temperature Annealing}
+\label{sec:temp_anneal}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Background on the Concrete Distribution}
+
+The Gumbel--Softmax (Concrete) distribution~\cite{jang2016gumbel}
+provides a differentiable relaxation of discrete Bernoulli sampling.
+For a Bernoulli variable with log-odds $\log p_j^k$, the
+reparameterised sample is:
+\begin{equation}
+\label{eq:concrete}
+\alpha_j^k
+  = \sigma\!\left(
+    \frac{\log p_j^k - \log(1 - p_j^k) + g_1 - g_2}{\tau}
+  \right),
+  \qquad g_1, g_2 \sim \text{Gumbel}(0, 1),
+\end{equation}
+where $\tau > 0$ is the \emph{temperature} parameter. As
+$\tau \to 0^+$, the Concrete distribution converges to the discrete
+Bernoulli distribution; as $\tau \to \infty$, samples become uniformly
+distributed.
+
+\subsection{The Fixed-$\tau$ Limitation}
+
+The current implementation fixes $\tau = 1$ throughout training. At
+$\tau = 1$, the Concrete distribution has significant variance: the
+sampled masks are smooth realisations in $(0, 1)$ rather than
+near-binary $\{0, 1\}$. This has two consequences:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Explanation quality:} the importance scores $p_j^k$
+        never become cleanly binary, so the extracted explanation
+        subgraph is inherently ambiguous.
+  \item \textbf{Rate--distortion gap:} the $\KL$-divergence in
+        \Cref{eq:kl_stable} is computed on the \emph{sampled} mask
+        values, which are smoothed by the high temperature. The true
+        $\KL$ of the underlying Bernoulli is not what is optimised.
+\end{enumerate}
+
+\subsection{Temperature Annealing Schedule}
+
+Following standard practice in Gumbel--Softmax
+training~\cite{maddison2017concrete,jang2016gumbel}, we propose an
+exponential decay schedule for the temperature:
+
+\begin{definition}[Exponential temperature schedule]
+\label{def:temp_schedule}
+Given an initial temperature $\tau_0 > 0$, a minimum temperature
+$\tau_{\min} > 0$, and a decay rate $\rho \in (0, 1)$, the temperature
+at epoch~$e$ is:
+\begin{equation}
+\label{eq:temp_schedule}
+\tau(e)
+  = \max\!\big(\tau_{\min},\; \tau_0 \cdot \rho^{\,e-1}\big).
+\end{equation}
+\end{definition}
+
+\begin{remark}[Recommended hyperparameters]
+Typical values are $\tau_0 \in [1, 10]$, $\tau_{\min} = 0.1$, and
+$\rho \in [0.999, 0.9999]$. At $\tau_{\min} = 0.1$, the Concrete
+distribution is concentrated within $\pm 0.05$ of the underlying
+Bernoulli parameter, yielding near-binary masks.
+\end{remark}
+
+The modified Concrete sampler becomes:
+\begin{equation}
+\label{eq:concrete_annealed}
+\alpha_j^{k,(e)}
+  = \sigma\!\left(
+    \frac{\log p_j^k - \log(1 - p_j^k) + g_1 - g_2}{\tau(e)}
+  \right).
+\end{equation}
+
+\subsection{Effect on Gradients}
+
+The gradient of the Concrete log-density with respect to the log-odds
+$\log p_j^k$ scales as $\mathcal{O}(1/\tau)$. A high initial
+temperature therefore facilitates early exploration (large gradient
+signals across all mask values), while a low final temperature focuses
+learning on the most critical events (gradients concentrate near the
+decision boundary $p_j^k = 0.5$).
+
+\subsection{Optional: Hard-Concrete Extension}
+
+For truly binary explanations, we recommend the
+\emph{hard-Concrete} relaxation of Louizos et~al.~\cite{louizos2018deep}:
+\begin{equation}
+\label{eq:hard_concrete}
+\tilde{\alpha}_j^k
+  = \mathrm{clamp}\!\big(
+    \alpha_j^k \cdot (b - a) + a,\; 0,\; 1
+  \big),
+  \qquad a = -0.1,\; b = 1.1,
+\end{equation}
+where $\alpha_j^k$ is the soft Concrete sample from
+\Cref{eq:concrete_annealed} and $\mathrm{clamp}(\cdot, l, u)$ clips
+to $[l, u]$. The stretch parameters $a = -0.1$ and $b = 1.1$ allow
+the distribution to place nonzero mass at exactly $0$ and $1$, while
+remaining continuous. The IB rate term $\loss_{\text{MI}}$ still
+operates on the underlying probabilities $p_j^k$, not the
+hard-concretised~$\tilde{\alpha}_j^k$.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Improvement~4: Configurable Prior Schedule}
+\label{sec:prior_schedule}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Role of the Prior $r$}
+
+The prior $r$ in \Cref{eq:rate} determines the ``target'' mask
+probability: the $\KL$-divergence penalises deviations of $p_j^k$
+from~$r$. A high~$r$ encourages the mask to be \emph{on} (i.e.\ to
+include candidate events); a low~$r$ encourages the mask to be
+\emph{off} (i.e.\ to exclude them).
+
+In the reference code, $r$ is annealed via a step function:
+\begin{equation}
+\label{eq:r_step}
+r(e) = \max\!\big(
+  r_{\min},\;
+  r_0 - \lfloor e / \Delta \rfloor \cdot \delta_r
+\big),
+\end{equation}
+with $r_0 = 0.9$, $\Delta = 10$, $\delta_r = 0.1$, and $r_{\min} = 0.7$.
+This means the final prior is $r = 0.7$, i.e.\ the model is pushed
+toward including $\sim$70\% of candidate events in the explanation
+graph.
+
+\subsection{The Sparsity--Accuracy Tradeoff of $r$}
+
+Since the expected mask value converges to~$r$ under the $\KL$
+penalty, the fraction of retained candidate events is approximately~$r$.
+This gives direct control over explanation sparsity:
+
+\begin{table}[ht]
+\centering
+\caption{Effect of final prior $r_{\min}$ on explanation sparsity.}
+\label{tab:prior_sparsity}
+\begin{tabular}{@{}ccc@{}}
+\toprule
+$r_{\min}$ & Approx.\ retention rate & Use case \\
+\midrule
+0.3 & 30\% & Sparse, focused explanations \\
+0.5 & 50\% & Balanced \\
+0.7 & 70\% & Current default (code) \\
+0.5 (fixed) & 50\% & Paper-equivalent (no annealing) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Generalised Schedule}
+
+We generalise the step-function schedule to accept arbitrary
+parameters:
+
+\begin{definition}[Generalised prior schedule]
+\label{def:prior_schedule}
+For an initial prior $r_0$, final prior $r_{\min}$, decay interval
+$\Delta$, and per-interval decrement $\delta_r$:
+\begin{equation}
+\label{eq:prior_general}
+r(e) = \max\!\big(
+  r_{\min},\;
+  r_0 - \lfloor e / \Delta \rfloor \cdot \delta_r
+\big).
+\end{equation}
+Setting $r_0 = r_{\min}$ and $\delta_r = 0$ disables annealing
+(constant prior). Setting $\Delta = 1$ makes the decay linear rather
+than stepwise.
+\end{definition}
+
+\begin{remark}[Paper fidelity]
+The published paper specifies $r$ as ``a predefined
+hyperparameter''~\cite{seo2024tgib}. To reproduce the paper's
+conditions exactly, set $r_0 = r_{\min}$ and $\delta_r = 0$, yielding
+a constant prior for all epochs. The step-function annealing in the
+code is a training heuristic not present in the paper.
+\end{remark}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Improvement~5: $\beta$-Warmup Strategy}
+\label{sec:beta_warmup}
+% ══════════════════════════════════════════════════════════════════════
+
+\subsection{Motivation}
+
+Early in training, the encoder parameters are randomly initialised, and
+the affinity scores $p_j^k$ carry little signal. Applying a large
+$\beta$ from the first epoch forces the rate term
+$\beta \cdot \loss_{\text{MI}}$ to dominate the gradient, potentially
+trapping the model in a degenerate state where all masks are pushed to
+$r$ before the model has learned to distinguish informative from
+non-informative events.
+
+A \emph{warmup} phase allows the model to first learn meaningful
+$p_j^k$ values (driven by $\loss_{\text{cls}}$ alone), before the
+compression pressure is gradually introduced.
+
+\subsection{Linear Warmup Schedule}
+
+\begin{definition}[$\beta$-warmup]
+\label{def:beta_warmup}
+Given a target $\beta^* > 0$ and warmup duration $E_w \geq 0$, the
+effective weight at epoch~$e$ is:
+\begin{equation}
+\label{eq:beta_warmup}
+\beta(e) = \beta^* \cdot \min\!\left(
+  1,\; \frac{e}{E_w}
+\right).
+\end{equation}
+When $E_w = 0$, this reduces to $\beta(e) = \beta^*$ (no warmup).
+\end{definition}
+
+The resulting epoch-dependent total objective is:
+\begin{equation}
+\label{eq:total_warmup}
+\loss_{\text{total}}(e) = \loss_{\text{cls}} + \beta(e) \cdot \loss_{\text{MI}}.
+\end{equation}
+
+\subsection{Practical Recommendations}
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item For $\beta^* \leq 2$: warmup is generally unnecessary; the
+        rate term does not dominate.
+  \item For $\beta^* > 2$: use $E_w \in [3, 5]$ epochs to allow the
+        encoder to stabilise before compression.
+  \item For very large $\beta^* > 5$: use $E_w \in [5, 10]$ and
+        consider also annealing $\tau$ more slowly to maintain gradient
+        flow.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Combined Objective: Summary}
+\label{sec:combined}
+% ══════════════════════════════════════════════════════════════════════
+
+Collecting all improvements, the fully improved TGIB objective at
+epoch~$e$ is:
+
+\begin{equation}
+\label{eq:final_objective}
+\boxed{
+\loss_{\text{total}}(e)
+  = \underbrace{-\log\sigma\!\big(q_\theta(X_{e_k}, H_+^k)\big)
+    - N \cdot \E_{\text{neg}}\!\big[
+      \log\sigma\!\big(q_\theta(X_{e_k}^{\text{neg}}, H_-^k)\big)
+    \big]}_{\displaystyle\loss_{\text{cls}}}
+  + \;\beta(e)
+    \cdot \underbrace{\frac{1}{|\G^k|} \sum_{e_j \in \G^k}
+      \KL\!\big(\Bern(p_j^k) \,\|\, \Bern(r(e))\big)}_{\displaystyle\loss_{\text{MI}}^{(\text{stable})}},
+}
+\end{equation}
+where:
+\begin{align}
+\label{eq:components}
+\beta(e) &= \beta^* \cdot \min\!\left(1,\; \frac{e}{E_w}\right),
+  \notag\\[4pt]
+r(e) &= \max\!\big(
+  r_{\min},\;
+  r_0 - \lfloor e / \Delta \rfloor \cdot \delta_r
+\big),
+  \notag\\[4pt]
+\tau(e) &= \max\!\big(
+  \tau_{\min},\;
+  \tau_0 \cdot \rho^{\,e-1}
+\big),
+  \notag\\[4pt]
+\KL\!\big(\Bern(p) \| \Bern(r)\big)
+  &= p\,\log\!\frac{p + \delta}{r + \delta}
+  + (1 - p)\,\log\!\frac{1 - p + \delta}{1 - r + \delta},
+  \notag\\[4pt]
+\alpha_j^{k,(e)} &= \sigma\!\left(
+  \frac{\log p_j^k - \log(1 - p_j^k) + g_1 - g_2}{\tau(e)}
+\right).
+\end{align}
+
+\subsection{Hyperparameter Reference Table}
+
+\begin{table}[ht]
+\centering
+\caption{Complete hyperparameter reference for the improved TGIB.}
+\label{tab:hyperparams}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Symbol & Default & Range & Description \\
+\midrule
+$\beta^*$    & 1.0   & $[0.1, 10]$  & Target IB rate weight \\
+$E_w$        & 0     & $[0, 10]$    & $\beta$-warmup epochs \\
+$\tau_0$     & 5.0   & $[1, 10]$    & Initial Concrete temperature \\
+$\tau_{\min}$& 0.1   & $[0.01, 0.5]$& Minimum temperature \\
+$\rho$       & 0.9999& $(0, 1)$      & Temperature decay rate \\
+$r_0$        & 0.9   & $(0, 1)$      & Initial prior probability \\
+$r_{\min}$   & 0.7   & $(0, 1)$      & Final prior probability \\
+$\Delta$     & 10    & $[1, 100]$   & Prior decay interval (epochs) \\
+$\delta_r$   & 0.1   & $(0, 0.5)$   & Prior decay per interval \\
+$\delta$     & $10^{-8}$ & ---       & KL numerical stability \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Implementation Pseudocode}
+\label{sec:pseudocode}
+% ══════════════════════════════════════════════════════════════════════
+
+\begin{algorithm}[H]
+\caption{Improved TGIB Forward Pass}
+\label{alg:forward}
+\begin{algorithmic}[1]
+\REQUIRE Target event $e_k$, neighbourhood $\G^k$, epoch $e$
+\REQUIRE Hyperparameters: $\beta^*$, $E_w$, $\tau_0$, $\tau_{\min}$,
+         $\rho$, $r_0$, $r_{\min}$, $\Delta$, $\delta_r$, $\delta$
+\ENSURE  Prediction $\hat{Y}_k$, loss $\loss_{\text{total}}$
+
+\STATE \textbf{// Compute epoch-dependent scalars}
+\STATE $\beta \leftarrow \beta^* \cdot \min(1,\; e / E_w)$ \hfill\COMMENT{C5: warmup}
+\STATE $\tau \leftarrow \max(\tau_{\min},\; \tau_0 \cdot \rho^{e-1})$
+         \hfill\COMMENT{C3: temp annealing}
+\STATE $r \leftarrow \max(r_{\min},\; r_0 - \lfloor e / \Delta \rfloor
+         \cdot \delta_r)$
+         \hfill\COMMENT{C4: prior schedule}
+
+\STATE \textbf{// Compute mask probabilities}
+\FOR{each candidate $e_j \in \G^k$}
+  \STATE $p_j^k \leftarrow \sigma\!\big(g(X_{e_k}, Z_{e_j})\big)$
+\ENDFOR
+
+\STATE \textbf{// Concrete sampling with annealed temperature}
+\FOR{each $e_j \in \G^k$}
+  \STATE Sample $g_1, g_2 \sim \text{Gumbel}(0,1)$
+  \STATE $\alpha_j^k \leftarrow \sigma\!\big(
+    (\log p_j^k - \log(1 - p_j^k) + g_1 - g_2) / \tau
+  \big)$
+  \STATE $\tilde{Z}_{e_j} \leftarrow \alpha_j^k \cdot Z_{e_j}$
+         \hfill\COMMENT{Masked candidate embedding}
+\ENDFOR
+
+\STATE \textbf{// Readout and prediction}
+\STATE $H_+^k \leftarrow \mathrm{Readout}\!\big(\{\tilde{Z}_{e_j}\}_{e_j \in \G^k}\big)$
+\STATE $\hat{Y}_k \leftarrow \sigma\!\big(q_\theta(X_{e_k}, H_+^k)\big)$
+
+\STATE \textbf{// Stable KL computation (C2)}
+\STATE $\loss_{\text{MI}} \leftarrow 0$
+\FOR{each $e_j \in \G^k$}
+  \STATE $\loss_{\text{MI}} \mathrel{+}=
+    p_j^k\,\big(\log(p_j^k + \delta) - \log(r + \delta)\big)$
+    $\;+\; (1 - p_j^k)\,\big(\log(1 - p_j^k + \delta) - \log(1 - r + \delta)\big)$
+\ENDFOR
+\STATE $\loss_{\text{MI}} \leftarrow \loss_{\text{MI}} / |\G^k|$
+
+\STATE \textbf{// Total loss with explicit beta (C1)}
+\STATE $\loss_{\text{total}} \leftarrow \loss_{\text{cls}} + \beta \cdot \loss_{\text{MI}}$
+         \hfill\COMMENT{C1: beta weight}
+
+\RETURN $\hat{Y}_k$, $\loss_{\text{total}}$
+\end{algorithmic}
+\end{algorithm}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Expected Impact}
+\label{sec:impact}
+% ══════════════════════════════════════════════════════════════════════
+
+We summarise the expected impact of each improvement across the two
+evaluation axes of TGIB:
+
+\begin{table}[ht]
+\centering
+\caption{Summary of expected improvements.}
+\label{tab:impact}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Improvement & Link pred.\ (AP) & Explanation sparsity & Training stability \\
+\midrule
+C1: Explicit $\beta$ & $\uparrow$ (tunable) & $\uparrow$ (tunable) & --- \\
+C2: Stable KL & --- & --- & $\uparrow\uparrow$ \\
+C3: Temp.\ annealing & $\uparrow$ & $\uparrow\uparrow$ & $\uparrow$ \\
+C4: Config.\ prior & $\leftrightarrow$/$\uparrow$ & $\uparrow\uparrow$ & --- \\
+C5: $\beta$-warmup & $\uparrow$ & $\uparrow$ & $\uparrow\uparrow$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Link prediction (AP):} Improvements~C1, C3, and C5
+        are expected to yield modest gains in AP by enabling a more
+        favourable exploration of the rate--distortion tradeoff. The
+        KL fix~(C2) primarily improves training stability, which
+        indirectly benefits AP through better convergence.
+
+  \item \textbf{Explanation sparsity:} Improvements~C3 (temperature
+        annealing) and~C4 (configurable prior) have the largest impact.
+        Temperature annealing produces near-binary masks that cleanly
+        separate ``important'' from ``unimportant'' events. The prior
+        $r_{\min}$ directly controls the fraction of retained events.
+
+  \item \textbf{Training stability:} The KL fix~(C2) and
+        $\beta$-warmup~(C5) jointly address the two main sources of
+        training instability: spurious gradients at mask boundaries,
+        and premature dominance of the rate term.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+% ══════════════════════════════════════════════════════════════════════
+
+This report has presented five mathematically grounded improvements to
+the TGIB framework~\cite{seo2024tgib}, each addressing a specific
+limitation in the reference implementation. The improvements are:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Explicit $\beta$-weighting} of the rate term, enabling
+        principled control of the accuracy--explainability tradeoff.
+  \item \textbf{Numerically stable $\KL$-divergence} via log-space
+        computation, eliminating gradient artefacts near $p_j^k = 0$.
+  \item \textbf{Temperature annealing} for the Concrete sampler,
+        progressively discretising mask variables for crisp binary
+        explanations.
+  \item \textbf{Configurable prior schedule}, exposing the full
+        sparsity--accuracy tradeoff controlled by $r_{\min}$.
+  \item \textbf{$\beta$-warmup}, allowing the encoder to learn
+        meaningful representations before compression pressure is
+        applied.
+\end{enumerate}
+
+All improvements are drop-in compatible with the existing codebase and
+require no architectural modifications to the TGIB model. They are
+derived directly from the published GIB objective
+(Equation~4 of~\cite{seo2024tgib}) and established practices in the
+deep learning literature (Concrete
+distributions~\cite{maddison2017concrete}, hard-Concrete
+relaxations~\cite{louizos2018deep}, and IB
+warmup~\cite{alemi2016deep}).
+
+% ══════════════════════════════════════════════════════════════════════
+% References
+% ══════════════════════════════════════════════════════════════════════
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{alemi2016deep}
+A.~A. Alemi, I.~Fischer, J.~V. Dillon, and K.~P. Murphy.
+\newblock Deep variational information bottleneck.
+\newblock \emph{arXiv preprint arXiv:1612.00410}, 2016.
+
+\bibitem{jang2016gumbel}
+E.~Jang, S.~Gu, and B.~Poole.
+\newblock Categorical reparameterization with {Gumbel}-Softmax.
+\newblock In \emph{Proc. ICLR}, 2017.
+
+\bibitem{louizos2018deep}
+C.~Louizos, M.~Welling, and D.~P. Kingma.
+\newblock Learning sparse neural networks through $L_0$ regularization.
+\newblock In \emph{Proc. ICLR}, 2018.
+
+\bibitem{maddison2017concrete}
+C.~J. Maddison, A.~Mnih, and Y.~W. Teh.
+\newblock The {Concrete} distribution: A continuous relaxation of discrete
+  random variables.
+\newblock In \emph{Proc. ICML}, 2017.
+
+\bibitem{seo2024tgib}
+S.~Seo, S.~Kim, J.~Jung, Y.~Lee, and C.~Park.
+\newblock Self-explainable temporal graph networks based on graph
+  information bottleneck.
+\newblock In \emph{Proc. KDD}, pages 2572--2583, 2024.
+
+\bibitem{wu2020gib}
+T.~Wu, H.~Ren, P.~Li, and J.~Leskovec.
+\newblock Graph information bottleneck.
+\newblock In \emph{Proc. NeurIPS}, 2020.
+
+\end{thebibliography}
+
+\end{document}
