@@ -8,6 +8,7 @@ import argparse
 import pdb
 
 import torch
+from torch.cuda.amp import GradScaler, autocast
 import pandas as pd
 import numpy as np
 #import numba
@@ -90,16 +91,17 @@ def eval_one_epoch(hint, tgib, sampler, val_src_l, val_dst_l, val_ts_l, val_e_id
     val_acc, val_ap, val_f1, val_auc = [], [], [], []
     with torch.no_grad():
         tgib = tgib.eval()
-        for k in range(1, len(val_src_l)):
-            tgib = tgib.eval()
-            
-            u_emb_fake, i_emb_fake = sampler.sample(1)
-            
-            pos_prob, neg_prob, info_loss = tgib(val_src_l[:k+1], val_dst_l[:k+1], i_emb_fake, val_ts_l[:k+1], val_e_idx_l[:k+1], k, epoch, training=False, num_neighbors=NUM_NEIGHBORS)               
+        for batch_start in range(1, len(val_src_l), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(val_src_l))
+            B = batch_end - batch_start
+            batch_indices = np.arange(batch_start, batch_end)
+            _, i_emb_fake = sampler.sample(B)
+
+            pos_prob, neg_prob, info_loss = tgib(val_src_l, val_dst_l, i_emb_fake, val_ts_l, val_e_idx_l, batch_indices, epoch, training=False, num_neighbors=NUM_NEIGHBORS)
             pred_score = np.concatenate([(pos_prob).cpu().detach().numpy(), (neg_prob).cpu().detach().numpy()])
             pred_label = pred_score > 0.5
-            true_label = np.concatenate([np.ones(1), np.zeros(1)])
-            
+            true_label = np.concatenate([np.ones(B), np.zeros(B)])
+
             val_acc.append((pred_label == true_label).mean())
             val_ap.append(average_precision_score(true_label, pred_score))
             val_f1.append(f1_score(true_label, pred_label))
@@ -215,6 +217,7 @@ criterion = torch.nn.BCELoss()
 
 
 optimizer = torch.optim.Adam(tgib.parameters(), lr=LEARNING_RATE)
+scaler = GradScaler()
 tgib = tgib.to(device)
 
 num_instance = len(train_src_l) 
@@ -233,34 +236,32 @@ for epoch in range(1, NUM_EPOCH+1):
     np.random.shuffle(idx_list)
     logger.info('start {} epoch'.format(epoch))
 
-    for k in range(1, len(train_src_l)):
-        u_emb_fake, i_emb_fake = train_rand_sampler.sample(1)
-        
-        with torch.no_grad():
-            pos_label = torch.ones(1, dtype=torch.float, device=device) 
-            neg_label = torch.zeros(1, dtype=torch.float, device=device) 
+    for batch_start in range(1, len(train_src_l), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(train_src_l))
+        B = batch_end - batch_start
+        batch_indices = np.arange(batch_start, batch_end)
+
+        u_emb_fake, i_emb_fake = train_rand_sampler.sample(B)
 
         optimizer.zero_grad()
         tgib = tgib.train()
-        
-        pos_prob, neg_prob, info_loss = tgib(train_src_l[:k+1], train_dst_l[:k+1], i_emb_fake, train_ts_l[:k+1], train_e_idx_l[:k+1], k, epoch, training=True, num_neighbors=NUM_NEIGHBORS)        
 
-        loss = criterion(pos_prob, pos_label)
-        loss += criterion(neg_prob, neg_label)
-        loss += info_loss
+        with autocast():
+            pos_prob, neg_prob, info_loss = tgib(train_src_l, train_dst_l, i_emb_fake, train_ts_l, train_e_idx_l, batch_indices, epoch, training=True, num_neighbors=NUM_NEIGHBORS)
+            pos_labels = torch.ones(B, dtype=torch.float, device=device)
+            neg_labels = torch.zeros(B, dtype=torch.float, device=device)
+            loss = criterion(pos_prob, pos_labels) + criterion(neg_prob, neg_labels) + info_loss
 
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        # get training results
         with torch.no_grad():
-            tgib = tgib.eval()
-            pred_score = np.concatenate([(pos_prob).cpu().detach().numpy(), (neg_prob).cpu().detach().numpy()])
+            pred_score = np.concatenate([pos_prob.cpu().float().numpy(), neg_prob.cpu().float().numpy()])
             pred_label = pred_score > 0.5
-            true_label = np.concatenate([np.ones(1), np.zeros(1)])
+            true_label = np.concatenate([np.ones(B), np.zeros(B)])
             acc.append((pred_label == true_label).mean())
             ap.append(average_precision_score(true_label, pred_score))
-            # f1.append(f1_score(true_label, pred_label))
             m_loss.append(loss.item())
             auc.append(roc_auc_score(true_label, pred_score))
             
@@ -296,10 +297,10 @@ tgib.eval()
 # testing phase use all information
 tgib.ngh_finder = full_ngh_finder
 test_acc, test_ap, test_f1, test_auc = eval_one_epoch('test for old nodes', tgib, test_rand_sampler, test_src_l, 
-test_dst_l, test_ts_l, test_e_idx_l,  )
+test_dst_l, test_ts_l, test_e_idx_l, best_epoch)
 
 nn_test_acc, nn_test_ap, nn_test_f1, nn_test_auc = eval_one_epoch('test for new nodes', tgib, nn_test_rand_sampler, nn_test_src_l, 
-nn_test_dst_l, nn_test_ts_l, nn_test_e_idx_l, epoch)
+nn_test_dst_l, nn_test_ts_l, nn_test_e_idx_l, best_epoch)
 
 logger.info('Test statistics: Old nodes -- acc: {}, auc: {}, ap: {}'.format(test_acc, test_auc, test_ap))
 logger.info('Test statistics: New nodes -- acc: {}, auc: {}, ap: {}'.format(nn_test_acc, nn_test_auc, nn_test_ap))

@@ -460,15 +460,16 @@ class TGIB(torch.nn.Module):
 
         self.sampling_size = 100
 
-    def forward(self, u_emb, i_emb, i_emb_fake, time, e_emb, k, epoch, training, num_neighbors=10):
+    def forward(self, u_emb, i_emb, i_emb_fake, time, e_emb, batch_indices, epoch, training, num_neighbors=10):
 
         device = self.n_feat_th.device
+        B = len(batch_indices)
+        num_event_neighbors = 2 * num_neighbors * (num_neighbors + 1)
 
-        # Z_ek
-        u_emb_k = u_emb[k][np.newaxis]
-        i_emb_k = i_emb[k][np.newaxis]
-        time_k = time[k][np.newaxis]
-        e_idx_k = (e_emb[k]-1)[np.newaxis]
+        u_emb_k = u_emb[batch_indices]
+        i_emb_k = i_emb[batch_indices]
+        time_k = time[batch_indices]
+        e_idx_k = (e_emb[batch_indices] - 1)
 
         t_idx_u_emb_k = self.tem_conv(u_emb_k, time_k, self.num_layers, num_neighbors)
         t_idx_i_emb_k = self.tem_conv(i_emb_k, time_k, self.num_layers, num_neighbors)
@@ -477,106 +478,98 @@ class TGIB(torch.nn.Module):
 
         time_tensor_k = torch.from_numpy(time_k).float().to(device)
         time_tensor_k = torch.unsqueeze(time_tensor_k, dim=1)
-        time_encoder_k = self.time_encoder(torch.zeros_like(time_tensor_k)).reshape(1, -1) 
+        time_encoder_k = self.time_encoder(torch.zeros_like(time_tensor_k)).squeeze(1)
 
         target_event_emb_k = torch.cat([t_idx_u_emb_k, t_idx_i_emb_k, time_encoder_k, t_idx_e_emb_k], dim=1)
 
-        # fake Z_ek
         fake_t_idx_i_emb_k = self.tem_conv(i_emb_fake, time_k, self.num_layers, num_neighbors)
         fake_target_event_emb_k = torch.cat([t_idx_u_emb_k, fake_t_idx_i_emb_k, time_encoder_k, t_idx_e_emb_k], dim=1)
 
+        one_hop_ngh_node_i_emb, one_hop_ngh_eidx_i_emb, one_hop_ngh_ts_i_emb = self.ngh_finder.get_temporal_neighbor(u_emb_k, time_k, num_neighbors)
 
-
-        # Z_ej
-        one_hop_ngh_node_i_emb, one_hop_ngh_eidx_i_emb, one_hop_ngh_ts_i_emb = self.ngh_finder.get_temporal_neighbor(u_emb_k, time_k, num_neighbors) 
-        one_hop_ngh_node_i_emb, one_hop_ngh_eidx_i_emb, one_hop_ngh_ts_i_emb = one_hop_ngh_node_i_emb.squeeze(), one_hop_ngh_eidx_i_emb.squeeze(), one_hop_ngh_ts_i_emb.squeeze()
-        one_hop_u_emb_i1 = t_idx_u_emb_k.repeat(num_neighbors,1)
-        one_hop_i_emb_i1 = self.tem_conv(one_hop_ngh_node_i_emb, one_hop_ngh_ts_i_emb, self.num_layers, num_neighbors)
+        one_hop_u_emb_i1 = t_idx_u_emb_k.unsqueeze(1).expand(-1, num_neighbors, -1)
+        one_hop_i_emb_i1 = self.tem_conv(one_hop_ngh_node_i_emb.flatten(), one_hop_ngh_ts_i_emb.flatten(), self.num_layers, num_neighbors).view(B, num_neighbors, -1)
         one_hop_e_idx_i1 = torch.from_numpy(one_hop_ngh_eidx_i_emb).long().to(device)
         one_hop_e_emb_i1 = self.edge_raw_embed(one_hop_e_idx_i1)
 
-        one_hop_time_del_i1 = time_k - one_hop_ngh_ts_i_emb
-        one_hop_time_del_i1 = torch.from_numpy(one_hop_time_del_i1).float().to(device)
-        one_hop_time_del_i1 = one_hop_time_del_i1.reshape(-1,1)
-        one_hop_time_encoder_i1 = self.time_encoder(one_hop_time_del_i1).reshape(num_neighbors,-1) 
+        one_hop_time_del_i1 = time_k[:, np.newaxis] - one_hop_ngh_ts_i_emb
+        one_hop_time_del_i1 = torch.from_numpy(one_hop_time_del_i1).float().to(device).reshape(-1, 1)
+        one_hop_time_encoder_i1 = self.time_encoder(one_hop_time_del_i1).reshape(B, num_neighbors, -1)
 
-        one_hop_event_emb_i1 = torch.cat([one_hop_u_emb_i1, one_hop_i_emb_i1, one_hop_time_encoder_i1, one_hop_e_emb_i1], dim=1)
+        one_hop_event_emb_i1 = torch.cat([one_hop_u_emb_i1, one_hop_i_emb_i1, one_hop_time_encoder_i1, one_hop_e_emb_i1], dim=2)
 
+        two_hop_ngh_node_u_emb, two_hop_ngh_eidx_u_emb, two_hop_ngh_ts_u_emb = self.ngh_finder.get_temporal_neighbor(one_hop_ngh_node_i_emb.flatten(), one_hop_ngh_ts_i_emb.flatten(), num_neighbors)
+        two_hop_ngh_node_u_emb = two_hop_ngh_node_u_emb.view(B, num_neighbors, num_neighbors)
+        two_hop_ngh_eidx_u_emb = two_hop_ngh_eidx_u_emb.view(B, num_neighbors, num_neighbors)
+        two_hop_ngh_ts_u_emb = two_hop_ngh_ts_u_emb.view(B, num_neighbors, num_neighbors)
 
-        two_hop_ngh_node_u_emb, two_hop_ngh_eidx_u_emb, two_hop_ngh_ts_u_emb = self.ngh_finder.get_temporal_neighbor(one_hop_ngh_node_i_emb, one_hop_ngh_ts_i_emb, num_neighbors) 
-        two_hop_ngh_node_u_emb, two_hop_ngh_eidx_u_emb, two_hop_ngh_ts_u_emb = two_hop_ngh_node_u_emb.squeeze(), two_hop_ngh_eidx_u_emb.squeeze(), two_hop_ngh_ts_u_emb.squeeze()
-        two_hop_u_emb_i1 = self.tem_conv(two_hop_ngh_node_u_emb.reshape(-1), two_hop_ngh_ts_u_emb.reshape(-1), self.num_layers, num_neighbors)
-        two_hop_i_emb_i1 = one_hop_i_emb_i1.repeat(1,num_neighbors).reshape(num_neighbors*num_neighbors, -1)
+        two_hop_u_emb_i1 = self.tem_conv(two_hop_ngh_node_u_emb.reshape(-1), two_hop_ngh_ts_u_emb.reshape(-1), self.num_layers, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
+        two_hop_i_emb_i1 = one_hop_i_emb_i1.unsqueeze(2).expand(-1, -1, num_neighbors, -1).reshape(B, num_neighbors * num_neighbors, -1)
         two_hop_e_idx_i1 = torch.from_numpy(two_hop_ngh_eidx_u_emb).long().to(device)
-        two_hop_e_emb_i1 = self.edge_raw_embed(two_hop_e_idx_i1).reshape(num_neighbors*num_neighbors, -1)
+        two_hop_e_emb_i1 = self.edge_raw_embed(two_hop_e_idx_i1.view(B, num_neighbors * num_neighbors))
 
-        two_hop_time_del_i1 = time_k - two_hop_ngh_ts_u_emb
-        two_hop_time_del_i1 = torch.from_numpy(two_hop_time_del_i1).float().to(device)
-        two_hop_time_del_i1 = two_hop_time_del_i1.reshape(-1,1)
-        two_hop_time_encoder_i1 = self.time_encoder(two_hop_time_del_i1).reshape(num_neighbors*num_neighbors, -1) 
-        
-        two_hop_event_emb_i1 = torch.cat([two_hop_u_emb_i1, two_hop_i_emb_i1, two_hop_time_encoder_i1, two_hop_e_emb_i1], dim=1)
+        two_hop_time_del_i1 = time_k[:, np.newaxis, np.newaxis] - two_hop_ngh_ts_u_emb
+        two_hop_time_del_i1 = torch.from_numpy(two_hop_time_del_i1).float().to(device).reshape(-1, 1)
+        two_hop_time_encoder_i1 = self.time_encoder(two_hop_time_del_i1).reshape(B, num_neighbors * num_neighbors, -1)
 
+        two_hop_event_emb_i1 = torch.cat([two_hop_u_emb_i1, two_hop_i_emb_i1, two_hop_time_encoder_i1, two_hop_e_emb_i1], dim=2)
 
-        one_hop_ngh_node_u_emb, one_hop_ngh_eidx_u_emb, one_hop_ngh_ts_u_emb = self.ngh_finder.get_temporal_neighbor(i_emb_k, time_k, num_neighbors) 
-        one_hop_ngh_node_u_emb, one_hop_ngh_eidx_u_emb, one_hop_ngh_ts_u_emb = one_hop_ngh_node_u_emb.squeeze(), one_hop_ngh_eidx_u_emb.squeeze(), one_hop_ngh_ts_u_emb.squeeze()
-        one_hop_u_emb_i2 = self.tem_conv(one_hop_ngh_node_u_emb, one_hop_ngh_ts_u_emb, self.num_layers, num_neighbors)
-        one_hop_i_emb_i2 = t_idx_i_emb_k.repeat(num_neighbors,1)
+        one_hop_ngh_node_u_emb, one_hop_ngh_eidx_u_emb, one_hop_ngh_ts_u_emb = self.ngh_finder.get_temporal_neighbor(i_emb_k, time_k, num_neighbors)
+
+        one_hop_u_emb_i2 = self.tem_conv(one_hop_ngh_node_u_emb.flatten(), one_hop_ngh_ts_u_emb.flatten(), self.num_layers, num_neighbors).view(B, num_neighbors, -1)
+        one_hop_i_emb_i2 = t_idx_i_emb_k.unsqueeze(1).expand(-1, num_neighbors, -1)
         one_hop_e_idx_i2 = torch.from_numpy(one_hop_ngh_eidx_u_emb).long().to(device)
         one_hop_e_emb_i2 = self.edge_raw_embed(one_hop_e_idx_i2)
 
-        one_hop_time_del_i2 = time_k - one_hop_ngh_ts_u_emb
-        one_hop_time_del_i2 = torch.from_numpy(one_hop_time_del_i2).float().to(device)
-        one_hop_time_del_i2 = one_hop_time_del_i2.reshape(-1,1)
-        one_hop_time_encoder_i2 = self.time_encoder(one_hop_time_del_i2).reshape(num_neighbors,-1) 
+        one_hop_time_del_i2 = time_k[:, np.newaxis] - one_hop_ngh_ts_u_emb
+        one_hop_time_del_i2 = torch.from_numpy(one_hop_time_del_i2).float().to(device).reshape(-1, 1)
+        one_hop_time_encoder_i2 = self.time_encoder(one_hop_time_del_i2).reshape(B, num_neighbors, -1)
 
-        one_hop_event_emb_i2 = torch.cat([one_hop_u_emb_i2, one_hop_i_emb_i2, one_hop_time_encoder_i2, one_hop_e_emb_i2], dim=1)
+        one_hop_event_emb_i2 = torch.cat([one_hop_u_emb_i2, one_hop_i_emb_i2, one_hop_time_encoder_i2, one_hop_e_emb_i2], dim=2)
 
+        two_hop_ngh_node_i_emb, two_hop_ngh_eidx_i_emb, two_hop_ngh_ts_i_emb = self.ngh_finder.get_temporal_neighbor(one_hop_ngh_node_u_emb.flatten(), one_hop_ngh_ts_u_emb.flatten(), num_neighbors)
+        two_hop_ngh_node_i_emb = two_hop_ngh_node_i_emb.view(B, num_neighbors, num_neighbors)
+        two_hop_ngh_eidx_i_emb = two_hop_ngh_eidx_i_emb.view(B, num_neighbors, num_neighbors)
+        two_hop_ngh_ts_i_emb = two_hop_ngh_ts_i_emb.view(B, num_neighbors, num_neighbors)
 
-        two_hop_ngh_node_i_emb, two_hop_ngh_eidx_i_emb, two_hop_ngh_ts_i_emb = self.ngh_finder.get_temporal_neighbor(one_hop_ngh_node_u_emb, one_hop_ngh_ts_u_emb, num_neighbors) 
-        two_hop_ngh_node_i_emb, two_hop_ngh_eidx_i_emb, two_hop_ngh_ts_i_emb = two_hop_ngh_node_i_emb.squeeze(), two_hop_ngh_eidx_i_emb.squeeze(), two_hop_ngh_ts_i_emb.squeeze()
-        two_hop_u_emb_i2 = one_hop_u_emb_i2.repeat(1,num_neighbors).reshape(num_neighbors*num_neighbors, -1)
-        two_hop_i_emb_i2 = self.tem_conv(two_hop_ngh_node_i_emb.reshape(-1), two_hop_ngh_ts_i_emb.reshape(-1), self.num_layers, num_neighbors)
+        two_hop_u_emb_i2 = one_hop_u_emb_i2.unsqueeze(2).expand(-1, -1, num_neighbors, -1).reshape(B, num_neighbors * num_neighbors, -1)
+        two_hop_i_emb_i2 = self.tem_conv(two_hop_ngh_node_i_emb.reshape(-1), two_hop_ngh_ts_i_emb.reshape(-1), self.num_layers, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
         two_hop_e_idx_i2 = torch.from_numpy(two_hop_ngh_eidx_i_emb).long().to(device)
-        two_hop_e_emb_i2 = self.edge_raw_embed(two_hop_e_idx_i2).reshape(num_neighbors*num_neighbors, -1)
+        two_hop_e_emb_i2 = self.edge_raw_embed(two_hop_e_idx_i2.view(B, num_neighbors * num_neighbors))
 
-        two_hop_time_del_i2 = time_k - two_hop_ngh_ts_i_emb
-        two_hop_time_del_i2 = torch.from_numpy(two_hop_time_del_i2).float().to(device)
-        two_hop_time_del_i2 = two_hop_time_del_i2.reshape(-1,1)
-        two_hop_time_encoder_i2 = self.time_encoder(two_hop_time_del_i2).reshape(num_neighbors*num_neighbors, -1)  
-        
-        two_hop_event_emb_i2 = torch.cat([two_hop_u_emb_i2, two_hop_i_emb_i2, two_hop_time_encoder_i2, two_hop_e_emb_i2], dim=1)
+        two_hop_time_del_i2 = time_k[:, np.newaxis, np.newaxis] - two_hop_ngh_ts_i_emb
+        two_hop_time_del_i2 = torch.from_numpy(two_hop_time_del_i2).float().to(device).reshape(-1, 1)
+        two_hop_time_encoder_i2 = self.time_encoder(two_hop_time_del_i2).reshape(B, num_neighbors * num_neighbors, -1)
 
-        target_event_emb_i = torch.cat([one_hop_event_emb_i1, one_hop_event_emb_i2, two_hop_event_emb_i1, two_hop_event_emb_i2], dim=0)
+        two_hop_event_emb_i2 = torch.cat([two_hop_u_emb_i2, two_hop_i_emb_i2, two_hop_time_encoder_i2, two_hop_e_emb_i2], dim=2)
 
-        pos_score_logits = self.affinity_score(target_event_emb_k.repeat(2*num_neighbors*(num_neighbors+1),1), target_event_emb_i) #.squeeze(dim=-1)
-        pos_score = self.sampling(pos_score_logits, training) # 여기서 simoid가 들어감..
-        pos_score = pos_score.reshape(-1)
+        target_event_emb_i = torch.cat([one_hop_event_emb_i1, one_hop_event_emb_i2, two_hop_event_emb_i1, two_hop_event_emb_i2], dim=1)
 
-        neg_score_logits = self.affinity_score(fake_target_event_emb_k.repeat(2*num_neighbors*(num_neighbors+1),1), target_event_emb_i) #.squeeze(dim=-1)
-        neg_score = self.sampling(neg_score_logits, training)
-        neg_score = neg_score.reshape(-1)
+        k_expanded = target_event_emb_k.unsqueeze(1).expand(-1, num_event_neighbors, -1).reshape(B * num_event_neighbors, -1)
+        i_flat = target_event_emb_i.reshape(B * num_event_neighbors, -1)
 
+        pos_score_logits = self.affinity_score(k_expanded, i_flat)
+        pos_score = self.sampling(pos_score_logits, training).reshape(B, num_event_neighbors)
 
+        neg_score_logits = self.affinity_score(fake_target_event_emb_k.unsqueeze(1).expand(-1, num_event_neighbors, -1).reshape(B * num_event_neighbors, -1), i_flat)
+        neg_score = self.sampling(neg_score_logits, training).reshape(B, num_event_neighbors)
 
         r = self.fix_r if self.fix_r else self.get_r(self.decay_interval, self.decay_r, epoch, final_r=self.final_r, init_r=self.init_r)
         pos_info_loss = (pos_score * torch.log(pos_score/r + 1e-6) + (1-pos_score) * torch.log((1-pos_score)/(1-r+1e-6) + 1e-6)).mean()
         neg_info_loss = (neg_score * torch.log(neg_score/r + 1e-6) + (1-neg_score) * torch.log((1-neg_score)/(1-r+1e-6) + 1e-6)).mean()
         info_loss = (pos_info_loss + neg_info_loss) / 2
 
-        pos_score = pos_score.reshape(-1,1)
-        pos_active_edge_emb = pos_score * target_event_emb_i
-        neg_score = neg_score.reshape(-1,1)
-        neg_active_edge_emb = neg_score * target_event_emb_i
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, num_event_neighbors).reshape(-1).long()
 
-        pos_active_graph = global_mean_pool(pos_active_edge_emb, batch=None)
-        pos_prob = self.probability_score(pos_active_graph, target_event_emb_k).sigmoid()
+        pos_active_edge_emb = pos_score.unsqueeze(2) * target_event_emb_i
+        pos_active_graph = global_mean_pool(pos_active_edge_emb.reshape(B * num_event_neighbors, -1), batch=batch_idx)
+        pos_prob = self.probability_score(pos_active_graph, target_event_emb_k).sigmoid().squeeze(1)
 
-        neg_active_graph = global_mean_pool(neg_active_edge_emb, batch=None)
-        neg_prob = self.probability_score(neg_active_graph, fake_target_event_emb_k).sigmoid()        
+        neg_active_edge_emb = neg_score.unsqueeze(2) * target_event_emb_i
+        neg_active_graph = global_mean_pool(neg_active_edge_emb.reshape(B * num_event_neighbors, -1), batch=batch_idx)
+        neg_prob = self.probability_score(neg_active_graph, fake_target_event_emb_k).sigmoid().squeeze(1)
 
-
-        return pos_prob.squeeze(dim=1), neg_prob.squeeze(dim=1), info_loss 
+        return pos_prob, neg_prob, info_loss
 
         
 
