@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import pdb
 
 class NeighborFinder:
     def __init__(self, adj_list, uniform=False):
@@ -32,7 +31,7 @@ class NeighborFinder:
         n_ts_l = []
         e_idx_l = []
         off_set_l = [0] 
-        # pdb.set_trace()
+
         for i in range(len(adj_list)):
             curr = adj_list[i]
             curr = sorted(curr, key=lambda x: x[1])
@@ -40,8 +39,6 @@ class NeighborFinder:
             e_idx_l.extend([x[1] for x in curr]) 
             n_ts_l.extend([x[2] for x in curr]) 
             off_set_l.append(len(n_idx_l)) 
-
-   
 
         n_idx_l = np.array(n_idx_l)
         n_ts_l = np.array(n_ts_l)
@@ -55,86 +52,76 @@ class NeighborFinder:
         
     def find_before(self, src_idx, cut_time): 
         """
-    
         Params
         ------
         src_idx: int
         cut_time: float
         """
-        node_idx_l = self.node_idx_l 
-        node_ts_l = self.node_ts_l 
-        edge_idx_l = self.edge_idx_l 
-        off_set_l = self.off_set_l 
-        
-        # pdb.set_trace()
-        neighbors_idx = node_idx_l[off_set_l[src_idx] : off_set_l[src_idx + 1]]
-        neighbors_ts = node_ts_l[off_set_l[src_idx] : off_set_l[src_idx + 1]]
-        neighbors_e_idx = edge_idx_l[off_set_l[src_idx] : off_set_l[src_idx + 1]]
-        
-        if len(neighbors_idx) == 0 or len(neighbors_ts) == 0:
-            return neighbors_idx, neighbors_ts, neighbors_e_idx
+        start = self.off_set_l[src_idx]
+        end = self.off_set_l[src_idx + 1]
 
-        left = 0
-        right = len(neighbors_idx) - 1
-        
-        while left + 1 < right:
-            mid = (left + right) // 2
-            curr_t = neighbors_ts[mid]
-            if curr_t < cut_time:
-                left = mid
-            else:
-                right = mid
-                
-        if neighbors_ts[right] < cut_time:
-            return neighbors_idx[:right], neighbors_e_idx[:right], neighbors_ts[:right]
-        else:
-            return neighbors_idx[:left], neighbors_e_idx[:left], neighbors_ts[:left]
+        if start == end:
+            return self.node_idx_l[start:end], self.edge_idx_l[start:end], self.node_ts_l[start:end]
+
+        neighbors_ts = self.node_ts_l[start:end]
+        n_valid = np.searchsorted(neighbors_ts, cut_time, side='left')
+
+        return (self.node_idx_l[start:start + n_valid],
+                self.edge_idx_l[start:start + n_valid],
+                self.node_ts_l[start:start + n_valid])
 
     def get_temporal_neighbor(self, src_idx_l, cut_time_l, num_neighbors=20):
         """
         Params
         ------
-        src_idx_l: List[int]
-        cut_time_l: List[float],
+        src_idx_l: numpy array of int
+        cut_time_l: numpy array of float
         num_neighbors: int
         """
         assert(len(src_idx_l) == len(cut_time_l))
         
-        out_ngh_node_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.int32) 
-        out_ngh_t_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.float32) 
-        out_ngh_eidx_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.int32) 
-        
-        for i, (src_idx, cut_time) in enumerate(zip(src_idx_l, cut_time_l)):
-            ngh_idx, ngh_eidx, ngh_ts = self.find_before(src_idx, cut_time)
-          
-            if len(ngh_idx) > 0: 
+        B = len(src_idx_l)
+        out_ngh_node_batch = np.zeros((B, num_neighbors), dtype=np.int32) 
+        out_ngh_t_batch = np.zeros((B, num_neighbors), dtype=np.float32) 
+        out_ngh_eidx_batch = np.zeros((B, num_neighbors), dtype=np.int32) 
 
-                if self.uniform: 
-                    sampled_idx = np.random.randint(0, len(ngh_idx), num_neighbors) # (20,)
-                    
-                    out_ngh_node_batch[i, :] = ngh_idx[sampled_idx]
-                    out_ngh_t_batch[i, :] = ngh_ts[sampled_idx]
-                    out_ngh_eidx_batch[i, :] = ngh_eidx[sampled_idx]
-                    
-                    # resort based on time
-                    pos = out_ngh_t_batch[i, :].argsort()
-                    out_ngh_node_batch[i, :] = out_ngh_node_batch[i, :][pos]
-                    out_ngh_t_batch[i, :] = out_ngh_t_batch[i, :][pos]
-                    out_ngh_eidx_batch[i, :] = out_ngh_eidx_batch[i, :][pos]
-                else:
-                    ngh_ts = ngh_ts[:num_neighbors]
-                    ngh_idx = ngh_idx[:num_neighbors]
-                    ngh_eidx = ngh_eidx[:num_neighbors]
-                    
-                    assert(len(ngh_idx) <= num_neighbors)
-                    assert(len(ngh_ts) <= num_neighbors)
-                    assert(len(ngh_eidx) <= num_neighbors)
-                    
-                    out_ngh_node_batch[i, num_neighbors - len(ngh_idx):] = ngh_idx
-                    out_ngh_t_batch[i, num_neighbors - len(ngh_ts):] = ngh_ts
-                    out_ngh_eidx_batch[i,  num_neighbors - len(ngh_eidx):] = ngh_eidx
+        off = self.off_set_l
+        node_idx = self.node_idx_l
+        node_ts = self.node_ts_l
+        edge_idx = self.edge_idx_l
 
-        # pdb.set_trace()   
+        for i in range(B):
+            src_idx = src_idx_l[i]
+            cut_time = cut_time_l[i]
+
+            start = off[src_idx]
+            end = off[src_idx + 1]
+
+            if start == end:
+                continue
+
+            n_valid = np.searchsorted(node_ts[start:end], cut_time, side='left')
+
+            if n_valid == 0:
+                continue
+
+            if self.uniform:
+                sample_count = min(n_valid, num_neighbors)
+                sampled_idx = np.random.randint(0, n_valid, sample_count)
+                out_ngh_node_batch[i, num_neighbors - sample_count:] = node_idx[start:end][sampled_idx]
+                out_ngh_t_batch[i, num_neighbors - sample_count:] = node_ts[start:end][sampled_idx]
+                out_ngh_eidx_batch[i, num_neighbors - sample_count:] = edge_idx[start:end][sampled_idx]
+
+                pos = out_ngh_t_batch[i, num_neighbors - sample_count:].argsort()
+                out_ngh_node_batch[i, num_neighbors - sample_count:] = out_ngh_node_batch[i, num_neighbors - sample_count:][pos]
+                out_ngh_t_batch[i, num_neighbors - sample_count:] = out_ngh_t_batch[i, num_neighbors - sample_count:][pos]
+                out_ngh_eidx_batch[i, num_neighbors - sample_count:] = out_ngh_eidx_batch[i, num_neighbors - sample_count:][pos]
+            else:
+                take_count = min(n_valid, num_neighbors)
+                out_ngh_node_batch[i, num_neighbors - take_count:] = node_idx[start:start + take_count]
+                out_ngh_t_batch[i, num_neighbors - take_count:] = node_ts[start:start + take_count]
+                out_ngh_eidx_batch[i, num_neighbors - take_count:] = edge_idx[start:start + take_count]
+
         return out_ngh_node_batch, out_ngh_eidx_batch, out_ngh_t_batch 
 
 
@@ -159,6 +146,3 @@ class NeighborFinder:
             eidx_records.append(out_ngh_eidx_batch)
             t_records.append(out_ngh_t_batch)
         return node_records, eidx_records, t_records
-
-            
-
