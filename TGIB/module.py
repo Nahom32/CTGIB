@@ -597,59 +597,51 @@ class TGIB(torch.nn.Module):
     
     def tem_conv(self, u_emb, time, curr_layers, num_neighbors):
         assert(curr_layers >= 0)
-        
+
         device = self.n_feat_th.device
-    
-        u_emb_th = torch.from_numpy(u_emb).long().to(device) 
-        time_th = torch.from_numpy(time).float().to(device) 
+        N = len(u_emb)
+        K = num_neighbors
 
-        time_th = torch.unsqueeze(time_th, dim=1)
+        src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor(
+            u_emb, time, num_neighbors=num_neighbors)
+        src_ngh_t_batch_delta = time[:, np.newaxis] - src_ngh_t_batch
 
-        src_node_t_embed = self.time_encoder(torch.zeros_like(time_th)) 
-        src_node_feat = self.node_raw_embed(u_emb_th) 
+        all_int_np = np.concatenate([u_emb.flatten(), src_ngh_node_batch.flatten(), src_ngh_eidx_batch.flatten()])
+        all_float_np = np.concatenate([time.flatten(), src_ngh_t_batch_delta.flatten()])
+        all_int_th = torch.from_numpy(all_int_np).long().to(device)
+        all_float_th = torch.from_numpy(all_float_np).float().to(device)
+
+        u_emb_th = all_int_th[:N]
+        ngh_node_th = all_int_th[N:N + N * K].view(N, K)
+        ngh_eidx_th = all_int_th[N + N * K:].view(N, K)
+        time_th = all_float_th[:N].unsqueeze(1)
+        ngh_t_delta_th = all_float_th[N:].view(N, K)
+
+        src_node_t_embed = self.time_encoder(torch.zeros_like(time_th))
+        src_node_feat = self.node_raw_embed(u_emb_th)
 
         if curr_layers == 0:
             return src_node_feat
-        else: ######
-            src_node_conv_feat = self.tem_conv(u_emb, 
-                                           time,
-                                           curr_layers=curr_layers - 1, 
-                                           num_neighbors=num_neighbors) 
-            
-            src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor( 
-                                                                    u_emb, 
-                                                                    time, 
-                                                                    num_neighbors=num_neighbors) 
 
-            src_ngh_node_batch_th = torch.from_numpy(src_ngh_node_batch).long().to(device)
-            src_ngh_eidx_batch = torch.from_numpy(src_ngh_eidx_batch).long().to(device)
-            
-            src_ngh_t_batch_delta = time[:, np.newaxis] - src_ngh_t_batch 
-            src_ngh_t_batch_th = torch.from_numpy(src_ngh_t_batch_delta).float().to(device)
-            
-            src_ngh_node_batch_flat = src_ngh_node_batch.flatten() 
-            src_ngh_t_batch_flat = src_ngh_t_batch.flatten() 
-            src_ngh_node_conv_feat = self.tem_conv(src_ngh_node_batch_flat, 
-                                                   src_ngh_t_batch_flat,
-                                                   curr_layers = curr_layers - 1, 
-                                                   num_neighbors=num_neighbors) 
-            src_ngh_feat = src_ngh_node_conv_feat.view(len(u_emb), num_neighbors, -1)
-            
+        src_node_conv_feat = self.tem_conv(u_emb, time, curr_layers=curr_layers - 1, num_neighbors=num_neighbors)
 
-            src_ngh_t_embed = self.time_encoder(src_ngh_t_batch_th)
-            src_ngn_edge_feat = self.edge_raw_embed(src_ngh_eidx_batch)
+        src_ngh_node_batch_flat = src_ngh_node_batch.flatten()
+        src_ngh_t_batch_flat = src_ngh_t_batch.flatten()
+        src_ngh_node_conv_feat = self.tem_conv(src_ngh_node_batch_flat, src_ngh_t_batch_flat, curr_layers=curr_layers - 1, num_neighbors=num_neighbors)
+        src_ngh_feat = src_ngh_node_conv_feat.view(N, K, -1)
 
+        src_ngh_t_embed = self.time_encoder(ngh_t_delta_th)
+        src_ngn_edge_feat = self.edge_raw_embed(ngh_eidx_th)
 
-            mask = src_ngh_node_batch_th == 0
-            attn_m = self.attn_model_list[curr_layers - 1]
+        mask = ngh_node_th == 0
+        attn_m = self.attn_model_list[curr_layers - 1]
 
+        local, weight = attn_m(src_node_conv_feat,
+                               src_node_t_embed,
+                               src_ngh_feat,
+                               src_ngh_t_embed,
+                               src_ngn_edge_feat,
+                               mask)
 
-            local, weight = attn_m(src_node_conv_feat, 
-                                src_node_t_embed,
-                                src_ngh_feat,
-                                src_ngh_t_embed, 
-                                src_ngn_edge_feat, 
-                                mask)
-
-            return local
+        return local
 
