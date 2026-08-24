@@ -25,7 +25,8 @@ from utils import EarlyStopMonitor, RandEdgeSampler
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for TGAT experiments on link predictions')
 parser.add_argument('-d', '--data', type=str, help='data sources to use, try wikipedia or reddit', default='wikipedia')
-parser.add_argument('--bs', type=int, default=200, help='batch_size')
+parser.add_argument('--bs', type=int, default=50, help='micro-batch_size')
+parser.add_argument('--accum_steps', type=int, default=4, help='gradient accumulation steps (effective batch = bs * accum_steps)')
 parser.add_argument('--prefix', type=str, default='', help='prefix to name the checkpoints')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample') ##############################
 parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
@@ -48,6 +49,7 @@ except:
     sys.exit(0)
 
 BATCH_SIZE = args.bs
+ACCUM_STEPS = args.accum_steps
 NUM_NEIGHBORS = args.n_degree
 NUM_NEG = 1
 NUM_EPOCH = args.n_epoch
@@ -243,18 +245,15 @@ for epoch in range(1, NUM_EPOCH+1):
 
         u_emb_fake, i_emb_fake = train_rand_sampler.sample(B)
 
-        optimizer.zero_grad()
         tgib = tgib.train()
 
         with autocast():
             pos_prob, neg_prob, info_loss = tgib(train_src_l, train_dst_l, i_emb_fake, train_ts_l, train_e_idx_l, batch_indices, epoch, training=True, num_neighbors=NUM_NEIGHBORS)
             pos_labels = torch.ones(B, dtype=torch.float, device=device)
             neg_labels = torch.zeros(B, dtype=torch.float, device=device)
-            loss = criterion(pos_prob, pos_labels) + criterion(neg_prob, neg_labels) + info_loss
+            loss = (criterion(pos_prob, pos_labels) + criterion(neg_prob, neg_labels) + info_loss) / ACCUM_STEPS
 
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
 
         with torch.no_grad():
             pred_score = np.concatenate([pos_prob.cpu().float().numpy(), neg_prob.cpu().float().numpy()])
@@ -262,8 +261,14 @@ for epoch in range(1, NUM_EPOCH+1):
             true_label = np.concatenate([np.ones(B), np.zeros(B)])
             acc.append((pred_label == true_label).mean())
             ap.append(average_precision_score(true_label, pred_score))
-            m_loss.append(loss.item())
+            m_loss.append(loss.item() * ACCUM_STEPS)
             auc.append(roc_auc_score(true_label, pred_score))
+
+        micro_step_idx = (batch_start - 1) // BATCH_SIZE
+        if (micro_step_idx + 1) % ACCUM_STEPS == 0 or batch_end >= len(train_src_l):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
             
     # validation phase use all information
     tgib.ngh_finder = full_ngh_finder
