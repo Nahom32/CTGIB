@@ -42,7 +42,7 @@ class ScaledDotProductAttention(torch.nn.Module):
         attn = attn / self.temperature
 
         if mask is not None:
-            attn = attn.masked_fill(mask, -1e10)
+            attn = attn.masked_fill(mask, -65504.0)
 
         attn = self.softmax(attn) # [n * b, l_q, l_k]
         attn = self.dropout(attn) # [n * b, l_v, d]
@@ -174,7 +174,7 @@ class MapBasedMultiHeadAttention(nn.Module):
         attn = self.weight_map(q_k).squeeze(dim=3) # [(n*b), lq, lk]
         
         if mask is not None:
-            attn = attn.masked_fill(mask, -1e10)
+            attn = attn.masked_fill(mask, -65504.0)
 
         attn = self.softmax(attn) # [n * b, l_q, l_k]
         attn = self.dropout(attn) # [n * b, l_q, l_k]
