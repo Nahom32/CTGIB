@@ -499,9 +499,9 @@ class TGIB(torch.nn.Module):
         one_hop_event_emb_i1 = torch.cat([one_hop_u_emb_i1, one_hop_i_emb_i1, one_hop_time_encoder_i1, one_hop_e_emb_i1], dim=2)
 
         two_hop_ngh_node_u_emb, two_hop_ngh_eidx_u_emb, two_hop_ngh_ts_u_emb = self.ngh_finder.get_temporal_neighbor(one_hop_ngh_node_i_emb.flatten(), one_hop_ngh_ts_i_emb.flatten(), num_neighbors)
-        two_hop_ngh_node_u_emb = two_hop_ngh_node_u_emb.view(B, num_neighbors, num_neighbors)
-        two_hop_ngh_eidx_u_emb = two_hop_ngh_eidx_u_emb.view(B, num_neighbors, num_neighbors)
-        two_hop_ngh_ts_u_emb = two_hop_ngh_ts_u_emb.view(B, num_neighbors, num_neighbors)
+        two_hop_ngh_node_u_emb = two_hop_ngh_node_u_emb.reshape(B, num_neighbors, num_neighbors)
+        two_hop_ngh_eidx_u_emb = two_hop_ngh_eidx_u_emb.reshape(B, num_neighbors, num_neighbors)
+        two_hop_ngh_ts_u_emb = two_hop_ngh_ts_u_emb.reshape(B, num_neighbors, num_neighbors)
 
         two_hop_u_emb_i1 = self.tem_conv(two_hop_ngh_node_u_emb.reshape(-1), two_hop_ngh_ts_u_emb.reshape(-1), self.num_layers, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
         two_hop_i_emb_i1 = one_hop_i_emb_i1.unsqueeze(2).expand(-1, -1, num_neighbors, -1).reshape(B, num_neighbors * num_neighbors, -1)
@@ -528,9 +528,9 @@ class TGIB(torch.nn.Module):
         one_hop_event_emb_i2 = torch.cat([one_hop_u_emb_i2, one_hop_i_emb_i2, one_hop_time_encoder_i2, one_hop_e_emb_i2], dim=2)
 
         two_hop_ngh_node_i_emb, two_hop_ngh_eidx_i_emb, two_hop_ngh_ts_i_emb = self.ngh_finder.get_temporal_neighbor(one_hop_ngh_node_u_emb.flatten(), one_hop_ngh_ts_u_emb.flatten(), num_neighbors)
-        two_hop_ngh_node_i_emb = two_hop_ngh_node_i_emb.view(B, num_neighbors, num_neighbors)
-        two_hop_ngh_eidx_i_emb = two_hop_ngh_eidx_i_emb.view(B, num_neighbors, num_neighbors)
-        two_hop_ngh_ts_i_emb = two_hop_ngh_ts_i_emb.view(B, num_neighbors, num_neighbors)
+        two_hop_ngh_node_i_emb = two_hop_ngh_node_i_emb.reshape(B, num_neighbors, num_neighbors)
+        two_hop_ngh_eidx_i_emb = two_hop_ngh_eidx_i_emb.reshape(B, num_neighbors, num_neighbors)
+        two_hop_ngh_ts_i_emb = two_hop_ngh_ts_i_emb.reshape(B, num_neighbors, num_neighbors)
 
         two_hop_u_emb_i2 = one_hop_u_emb_i2.unsqueeze(2).expand(-1, -1, num_neighbors, -1).reshape(B, num_neighbors * num_neighbors, -1)
         two_hop_i_emb_i2 = self.tem_conv(two_hop_ngh_node_i_emb.reshape(-1), two_hop_ngh_ts_i_emb.reshape(-1), self.num_layers, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
