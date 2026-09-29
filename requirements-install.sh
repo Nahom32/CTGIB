@@ -6,14 +6,26 @@ set -euo pipefail
 #   Tesla V100-SXM2
 #   PyTorch 2.1.2 + CUDA 11.8
 #
-# IMPORTANT:
-# The server shown by nvidia-smi has driver 470.256.02, which is too old
-# for the CUDA 11.8 PyTorch wheel. This script therefore checks the driver
-# first and stops with an actionable error instead of installing a broken
-# environment.
+# The server's driver is 470.256.02 (CUDA 11.4). That is fine for the
+# cu118 wheels: NVIDIA's minor version compatibility guarantee requires
+# only driver >= 450 for the whole CUDA 11.x family, so a 11.8 binary runs
+# on a 11.4 driver. The commonly reported "torch 2.1 does not work on
+# 470" failures are people on the default cu121 wheel from PyPI, which
+# needs driver >= 525. This script deliberately installs cu118 instead.
+#
+# The driver check below therefore only rejects drivers below 450.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-.venv}"
+
+# Resolve paths relative to this script so it can be run from anywhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
+
+if [ ! -f "$REQUIREMENTS" ]; then
+  echo "ERROR: requirements.txt not found next to this script ($REQUIREMENTS)."
+  exit 1
+fi
 
 echo "==> Checking Python..."
 
@@ -50,9 +62,10 @@ echo "    Driver: $DRIVER"
 
 DRIVER_MAJOR="${DRIVER%%.*}"
 
-# CUDA 11.8 requires an NVIDIA driver new enough to support CUDA 11.8.
-# Refuse to continue with the user's current 470.x driver.
-if [ "$DRIVER_MAJOR" -lt 520 ]; then
+# NVIDIA's minor version compatibility table: the CUDA 11.x family as a
+# whole requires driver >= 450. Anything below that cannot run a cu118
+# binary, so refuse rather than build a broken environment.
+if [ "$DRIVER_MAJOR" -lt 450 ]; then
   echo
   echo "ERROR: NVIDIA driver $DRIVER is too old for PyTorch 2.1.2 + CUDA 11.8."
   echo
@@ -61,8 +74,20 @@ if [ "$DRIVER_MAJOR" -lt 520 ]; then
   echo "  CUDA runtime 11.8"
   echo "  Tesla V100"
   echo
-  echo "Ask the server administrator to upgrade the NVIDIA driver"
-  echo "to a CUDA-11.8-compatible driver (>= 520.x)."
+  echo "CUDA 11.x needs driver >= 450 (see NVIDIA's minor version"
+  echo "compatibility table). Ask the server administrator to upgrade"
+  echo "the NVIDIA driver."
+  echo
+  echo "No packages were installed."
+  exit 1
+fi
+
+# The cu118 index publishes no aarch64 wheel for torch 2.1.2, so failing
+# here is far clearer than a confusing "no matching distribution" later.
+if [ "$(uname -m)" != "x86_64" ]; then
+  echo
+  echo "ERROR: no cu118 wheel for torch 2.1.2 on $(uname -m)."
+  echo "       The PyTorch cu118 index ships linux_x86_64 only."
   echo
   echo "No packages were installed."
   exit 1
@@ -85,13 +110,11 @@ python -m pip install \
   torch==2.1.2 \
   --index-url https://download.pytorch.org/whl/cu118
 
-echo "==> Installing the remaining Python packages..."
-python -m pip install \
-  "numpy>=1.24,<1.26" \
-  "pandas>=2.0,<2.1" \
-  "torch-geometric>=2.3,<2.4" \
-  "tqdm>=4.60" \
-  "scikit-learn>=1.3,<1.4"
+# Must come after the torch install: the cu118 wheel is what makes the GPU
+# work on this driver. torch==2.1.2 is already satisfied by 2.1.2+cu118, so
+# this will not pull the cu121 wheel from PyPI.
+echo "==> Installing the remaining Python packages from $REQUIREMENTS..."
+python -m pip install -r "$REQUIREMENTS"
 
 echo "==> Verifying PyTorch/CUDA..."
 
