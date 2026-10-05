@@ -389,10 +389,13 @@ class AttnModel(torch.nn.Module):
 class TGIB(torch.nn.Module):
     def __init__(self, ngh_finder, n_feat, e_feat, hidden,
                  attn_mode='prod', use_time='time', agg_method='attn', node_dim=None, time_dim=None,
-                 num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None):
+                 num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None,
+                 two_hop_depth=None, row_dedup=True):
         super(TGIB, self).__init__()    
         
         self.num_layers = num_layers 
+        self.two_hop_depth = min(num_layers, 1) if two_hop_depth is None else two_hop_depth
+        self.row_dedup = row_dedup
         self.ngh_finder = ngh_finder
         self.null_idx = null_idx
         self.logger = logging.getLogger(__name__)
@@ -503,7 +506,7 @@ class TGIB(torch.nn.Module):
         two_hop_ngh_eidx_u_emb = two_hop_ngh_eidx_u_emb.reshape(B, num_neighbors, num_neighbors)
         two_hop_ngh_ts_u_emb = two_hop_ngh_ts_u_emb.reshape(B, num_neighbors, num_neighbors)
 
-        two_hop_u_emb_i1 = self.tem_conv(two_hop_ngh_node_u_emb.reshape(-1), two_hop_ngh_ts_u_emb.reshape(-1), self.num_layers, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
+        two_hop_u_emb_i1 = self.tem_conv(two_hop_ngh_node_u_emb.reshape(-1), two_hop_ngh_ts_u_emb.reshape(-1), self.two_hop_depth, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
         two_hop_i_emb_i1 = one_hop_i_emb_i1.unsqueeze(2).expand(-1, -1, num_neighbors, -1).reshape(B, num_neighbors * num_neighbors, -1)
         two_hop_e_idx_i1 = torch.from_numpy(two_hop_ngh_eidx_u_emb).long().to(device)
         two_hop_e_emb_i1 = self.edge_raw_embed(two_hop_e_idx_i1.view(B, num_neighbors * num_neighbors))
@@ -533,7 +536,7 @@ class TGIB(torch.nn.Module):
         two_hop_ngh_ts_i_emb = two_hop_ngh_ts_i_emb.reshape(B, num_neighbors, num_neighbors)
 
         two_hop_u_emb_i2 = one_hop_u_emb_i2.unsqueeze(2).expand(-1, -1, num_neighbors, -1).reshape(B, num_neighbors * num_neighbors, -1)
-        two_hop_i_emb_i2 = self.tem_conv(two_hop_ngh_node_i_emb.reshape(-1), two_hop_ngh_ts_i_emb.reshape(-1), self.num_layers, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
+        two_hop_i_emb_i2 = self.tem_conv(two_hop_ngh_node_i_emb.reshape(-1), two_hop_ngh_ts_i_emb.reshape(-1), self.two_hop_depth, num_neighbors).view(B, num_neighbors * num_neighbors, -1)
         two_hop_e_idx_i2 = torch.from_numpy(two_hop_ngh_eidx_i_emb).long().to(device)
         two_hop_e_emb_i2 = self.edge_raw_embed(two_hop_e_idx_i2.view(B, num_neighbors * num_neighbors))
 
@@ -599,36 +602,38 @@ class TGIB(torch.nn.Module):
         assert(curr_layers >= 0)
 
         device = self.n_feat_th.device
-        N = len(u_emb)
         K = num_neighbors
 
-        src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor(
-            u_emb, time, num_neighbors=num_neighbors)
-        src_ngh_t_batch_delta = time[:, np.newaxis] - src_ngh_t_batch
+        uniq_u_emb, uniq_time, inverse = self._dedup_rows(u_emb, time, curr_layers)
+        U = len(uniq_u_emb)
 
-        all_int_np = np.concatenate([u_emb.flatten(), src_ngh_node_batch.flatten(), src_ngh_eidx_batch.flatten()])
-        all_float_np = np.concatenate([time.flatten(), src_ngh_t_batch_delta.flatten()])
+        src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor(
+            uniq_u_emb, uniq_time, num_neighbors=K)
+        src_ngh_t_batch_delta = uniq_time[:, np.newaxis] - src_ngh_t_batch
+
+        all_int_np = np.concatenate([uniq_u_emb.flatten(), src_ngh_node_batch.flatten(), src_ngh_eidx_batch.flatten()])
+        all_float_np = np.concatenate([uniq_time.flatten(), src_ngh_t_batch_delta.flatten()])
         all_int_th = torch.from_numpy(all_int_np).long().to(device)
         all_float_th = torch.from_numpy(all_float_np).float().to(device)
 
-        u_emb_th = all_int_th[:N]
-        ngh_node_th = all_int_th[N:N + N * K].view(N, K)
-        ngh_eidx_th = all_int_th[N + N * K:].view(N, K)
-        time_th = all_float_th[:N].unsqueeze(1)
-        ngh_t_delta_th = all_float_th[N:].view(N, K)
+        u_emb_th = all_int_th[:U]
+        ngh_node_th = all_int_th[U:U + U * K].view(U, K)
+        ngh_eidx_th = all_int_th[U + U * K:].view(U, K)
+        time_th = all_float_th[:U].unsqueeze(1)
+        ngh_t_delta_th = all_float_th[U:].view(U, K)
 
         src_node_t_embed = self.time_encoder(torch.zeros_like(time_th))
         src_node_feat = self.node_raw_embed(u_emb_th)
 
         if curr_layers == 0:
-            return src_node_feat
+            return src_node_feat if inverse is None else src_node_feat[inverse]
 
-        src_node_conv_feat = self.tem_conv(u_emb, time, curr_layers=curr_layers - 1, num_neighbors=num_neighbors)
+        src_node_conv_feat = self.tem_conv(uniq_u_emb, uniq_time, curr_layers=curr_layers - 1, num_neighbors=K)
 
         src_ngh_node_batch_flat = src_ngh_node_batch.flatten()
         src_ngh_t_batch_flat = src_ngh_t_batch.flatten()
-        src_ngh_node_conv_feat = self.tem_conv(src_ngh_node_batch_flat, src_ngh_t_batch_flat, curr_layers=curr_layers - 1, num_neighbors=num_neighbors)
-        src_ngh_feat = src_ngh_node_conv_feat.view(N, K, -1)
+        src_ngh_node_conv_feat = self.tem_conv(src_ngh_node_batch_flat, src_ngh_t_batch_flat, curr_layers=curr_layers - 1, num_neighbors=K)
+        src_ngh_feat = src_ngh_node_conv_feat.view(U, K, -1)
 
         src_ngh_t_embed = self.time_encoder(ngh_t_delta_th)
         src_ngn_edge_feat = self.edge_raw_embed(ngh_eidx_th)
@@ -643,5 +648,35 @@ class TGIB(torch.nn.Module):
                                src_ngn_edge_feat,
                                mask)
 
+        if inverse is not None:
+            local = local[inverse]
         return local
+
+    def _dedup_rows(self, u_emb, time, curr_layers):
+        """Collapse duplicate (node, cut_time) rows so each is sampled and
+        attended exactly once instead of once per duplicate.
+
+        A row of tem_conv's output depends only on that row's own (node,
+        cut_time) pair, so gathering the unique rows' results back with
+        `inverse` is equivalent to computing every row separately.
+
+        Returns (u_emb, time, inverse) where inverse is None when dedup
+        would not remove any work.
+        """
+        device = self.n_feat_th.device
+        N = len(u_emb)
+
+        if not self.row_dedup or curr_layers == 0 or N < 2:
+            return u_emb, time, None
+
+        u_arr = np.asarray(u_emb)
+        t_arr = np.asarray(time)
+        packed = np.stack([u_arr.astype(np.int64), t_arr.astype(np.float64)], axis=1)
+        first_idx, inverse_np = np.unique(packed, axis=0, return_index=True, return_inverse=True)[1:]
+
+        if first_idx.shape[0] == N:
+            return u_arr, t_arr, None
+
+        inverse = torch.from_numpy(inverse_np.reshape(-1).astype(np.int64)).to(device)
+        return u_arr[first_idx], t_arr[first_idx], inverse
 
