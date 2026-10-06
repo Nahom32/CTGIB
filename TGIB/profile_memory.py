@@ -19,6 +19,7 @@ same files learn_edge.py expects. Nothing here is written to disk.
 """
 import argparse
 import random
+import time
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,10 @@ p.add_argument('--sweep', action='store_true',
                help='sweep --bs x --n_degree for a memory-safe launch config')
 p.add_argument('--accum-check', action='store_true',
                help='replay learn_edge.py accumulation arithmetic')
+p.add_argument('--checkpoint', action='store_true',
+               help='measure gradient checkpointing: saved activations and wall time')
+p.add_argument('--correctness', action='store_true',
+               help='assert checkpointing does not change results, incl. under --uniform')
 p.add_argument('--uniform', action='store_true')
 args = p.parse_args()
 
@@ -82,7 +87,10 @@ model = TGIB(NeighborFinder(adj_list, uniform=args.uniform), n_feat, e_feat, 64,
              attn_mode='prod', n_head=args.n_head, drop_out=0.1)
 
 rows_seen = []
-if args.real:
+# --checkpoint and --correctness measure retained activations, which only exist if
+# the real attention math runs; a stubbed forward would report a meaningless floor.
+use_real_math = args.real or args.checkpoint or args.correctness
+if use_real_math:
     # keep the real math, just count the rows that enter it
     _orig_attn_fwd = AttnModel.forward
 
@@ -209,6 +217,89 @@ if args.accum_check:
     print('\nnote: gradient accumulation does NOT reduce activation memory --\n'
           'memory is set by --bs and --n_degree alone. --accum_steps only changes\n'
           'how many micro-batches contribute to each optimizer update.')
+
+if args.checkpoint:
+    # Gradient checkpointing trades recompute for retained activations. CUDA memory is
+    # unavailable here, so measure the thing checkpointing actually changes: the
+    # tensors autograd stashes for backward, via saved_tensors_hooks. Also time
+    # forward+backward to show the compute it costs.
+    print('\n### gradient checkpointing: retained activations and wall time ###')
+    print(f'{"config":<34}{"saved_tensors":>15}{"saved_MiB":>12}'
+          f'{"fwd+bwd_s":>10}{"loss":>10}')
+    for uniform in (False, True):
+        for ckpt in (False, True):
+            torch.manual_seed(2020)
+            np.random.seed(2020)
+            m = TGIB(NeighborFinder(adj_list, uniform=uniform), n_feat, e_feat, 64,
+                     num_layers=args.n_layer, use_time='time', agg_method='attn',
+                     attn_mode='prod', n_head=args.n_head, drop_out=0.0,
+                     use_checkpoint=ckpt)
+            # two_hop_depth=num_layers with dedup off is the case that needs this
+            m.two_hop_depth, m.row_dedup = args.n_layer, False
+            m.train()
+            B = args.bs[0]
+            bidx = np.arange(1, B + 1)
+            fake = np.random.default_rng(0).integers(1, max_idx + 1, B)
+            count = [0]
+            nbytes = [0]
+
+            def pack(t):
+                count[0] += 1
+                nbytes[0] += t.numel() * t.element_size()
+                return t
+
+            t0 = time.time()
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+                pos, neg, info = m(src_l, dst_l, fake, ts_l, e_idx_l, bidx, 1,
+                                   training=True, num_neighbors=K)
+                loss = pos.mean() + neg.mean() + info
+                loss.backward()
+            dt = time.time() - t0
+            print(f'{f"uniform={uniform} checkpoint={ckpt}":<34}{count[0]:>15,}'
+                  f'{nbytes[0] / 2**20:>12.1f}{dt:>10.2f}{float(loss):>10.4f}')
+            del m
+    print('\nsaved_MiB is the activation memory checkpointing removes; fwd+bwd_s is')
+    print('the recompute it costs. dedup=off deliberately, since that is the only')
+    print('configuration where checkpointing is worth its cost.')
+
+if args.correctness:
+    # The failure mode checkpointing risks here: get_temporal_neighbor draws from
+    # numpy under --uniform, and preserve_rng_state does NOT cover numpy RNG. Had the
+    # sampling been inside the checkpointed region, the recompute would resample
+    # different neighbors and silently change results. Prove it does not.
+    print('\n### checkpoint correctness (uniform is the risky case) ###')
+    for uniform in (False, True):
+        outs, grads = {}, {}
+        for ckpt in (False, True):
+            torch.manual_seed(2020)
+            np.random.seed(7)
+            m = TGIB(NeighborFinder(adj_list, uniform=uniform), n_feat, e_feat, 64,
+                     num_layers=args.n_layer, use_time='time', agg_method='attn',
+                     attn_mode='prod', n_head=args.n_head, drop_out=0.0,
+                     use_checkpoint=ckpt)
+            m.two_hop_depth, m.row_dedup = args.n_layer, False
+            m.train()
+            B = args.bs[0]
+            torch.manual_seed(2020)
+            np.random.seed(7)
+            pos, neg, info = m(src_l, dst_l,
+                               np.random.default_rng(0).integers(1, max_idx + 1, B),
+                               ts_l, e_idx_l, np.arange(1, B + 1), 1,
+                               training=True, num_neighbors=K)
+            loss = pos.mean() + neg.mean() + info
+            loss.backward()
+            outs[ckpt] = torch.cat([pos.detach(), neg.detach()])
+            grads[ckpt] = torch.cat([v.grad.flatten().clone()
+                                     for v in m.parameters() if v.grad is not None])
+            del m
+        od = float((outs[False] - outs[True]).abs().max())
+        gd = float((grads[False] - grads[True]).abs().max())
+        scale = max(float(grads[False].abs().max()), 1e-12)
+        ok = od < 1e-6 and gd / scale < 1e-5
+        print(f'  uniform={str(uniform):5s} out_maxdiff={od:.3e}  '
+              f'grad_maxdiff={gd:.3e} (rel {gd / scale:.2e})  '
+              f'{"MATCH" if ok else "MISMATCH"}')
+        assert ok, f'checkpointing changed results under uniform={uniform}'
 
 if args.real:
     print('\nnumerical smoke test (real attention math):')

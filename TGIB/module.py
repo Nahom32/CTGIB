@@ -2,6 +2,7 @@ import logging
 
 import numpy as np
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -390,12 +391,13 @@ class TGIB(torch.nn.Module):
     def __init__(self, ngh_finder, n_feat, e_feat, hidden,
                  attn_mode='prod', use_time='time', agg_method='attn', node_dim=None, time_dim=None,
                  num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None,
-                 two_hop_depth=None, row_dedup=True):
+                 two_hop_depth=None, row_dedup=True, use_checkpoint=False):
         super(TGIB, self).__init__()    
         
         self.num_layers = num_layers 
         self.two_hop_depth = min(num_layers, 1) if two_hop_depth is None else two_hop_depth
         self.row_dedup = row_dedup
+        self.use_checkpoint = use_checkpoint
         self.ngh_finder = ngh_finder
         self.null_idx = null_idx
         self.logger = logging.getLogger(__name__)
@@ -641,15 +643,34 @@ class TGIB(torch.nn.Module):
         mask = ngh_node_th == 0
         attn_m = self.attn_model_list[curr_layers - 1]
 
-        local, weight = attn_m(src_node_conv_feat,
+        if self.use_checkpoint and torch.is_grad_enabled():
+            local = checkpoint(self._apply_attn, attn_m,
+                               src_node_conv_feat,
                                src_node_t_embed,
                                src_ngh_feat,
                                src_ngh_t_embed,
                                src_ngn_edge_feat,
-                               mask)
+                               mask,
+                               use_reentrant=False)
+        else:
+            local = self._apply_attn(attn_m, src_node_conv_feat,
+                                     src_node_t_embed,
+                                     src_ngh_feat,
+                                     src_ngh_t_embed,
+                                     src_ngn_edge_feat,
+                                     mask)
 
         if inverse is not None:
             local = local[inverse]
+        return local
+
+    def _apply_attn(self, attn_m, src, src_t, seq, seq_t, seq_e, mask):
+        """Run one attention aggregation and discard its weights.
+
+        tem_conv never uses the attention weights, so they are dropped here rather
+        than returned -- that keeps them from being retained by checkpointing.
+        """
+        local, _ = attn_m(src, src_t, seq, seq_t, seq_e, mask)
         return local
 
     def _dedup_rows(self, u_emb, time, curr_layers):
