@@ -36,6 +36,10 @@ p.add_argument('--bs', type=int, nargs='+', default=[10, 20])
 p.add_argument('--steps', type=int, default=3, help='smoke steps when --real')
 p.add_argument('--real', action='store_true', help='do not stub attention math')
 p.add_argument('--dedup-detail', action='store_true', help='per-call dedup table')
+p.add_argument('--sweep', action='store_true',
+               help='sweep --bs x --n_degree for a memory-safe launch config')
+p.add_argument('--accum-check', action='store_true',
+               help='replay learn_edge.py accumulation arithmetic')
 p.add_argument('--uniform', action='store_true')
 args = p.parse_args()
 
@@ -112,9 +116,12 @@ print(f'{"config":<32}{"attn_calls":>11}{"total_rows":>13}{"peak_rows":>12}'
 print(f'{"=" * 88}')
 
 baseline = None
-for B in args.bs:
-    for depth in (args.n_layer, min(args.n_layer, 1)):
+for B in (args.bs if not args.sweep else [args.bs[0]]):
+    for depth in ((args.n_layer, min(args.n_layer, 1)) if not args.sweep
+                  else (args.n_layer,)):
         for dedup in (False, True):
+            if args.sweep and dedup:
+                continue
             rows_seen.clear()
             model.two_hop_depth, model.row_dedup = depth, dedup
             model.eval()
@@ -153,6 +160,55 @@ if args.dedup_detail:
         print(f'  curr_layers={depth}  rows={rows:>7,}  unique_nodes={nuniq:>6,}{tag}')
     print(f'  TOTAL     rows={tot_in:>8,}  unique={tot_uniq:>8,}  '
           f'overall={tot_in / max(tot_uniq, 1):.2f}x')
+
+if args.sweep:
+    # Sweep --bs x --n_degree at full depth. Only the dedup=off column matters for
+    # picking a memory-safe config; dedup=on sits at ~10 peak rows everywhere, so it
+    # would only clutter the table.
+    bs_grid = [4, 10, 20]
+    k_grid = [5, 8, 10, 20]
+    print('\n### config sweep at two_hop_depth=num_layers, dedup=off ###')
+    print(f'{"n_degree":>9}' + ''.join(f'{"bs=" + str(b):>10}' for b in bs_grid))
+    for k in k_grid:
+        cells = []
+        for B in bs_grid:
+            model.ngh_finder = NeighborFinder(adj_list, uniform=args.uniform)
+            model.two_hop_depth, model.row_dedup = args.n_layer, False
+            rows_seen.clear()
+            model.eval()
+            fake = np.random.default_rng(0).integers(1, max_idx + 1, B)
+            with torch.no_grad():
+                model(src_l, dst_l, fake, ts_l, e_idx_l, np.arange(1, B + 1), 1,
+                      training=False, num_neighbors=k)
+            gib = max(rows_seen) * k * MODEL_DIM * 2 / 2**30
+            cells.append(f'{gib:>10.2f}')
+        print(f'{k:>9}' + ''.join(cells))
+    print('\nvalues are peak_GiB for ONE fp16 attention projection, i.e. a lower\n'
+          'bound. Actual peak is several times this -- roughly 6 such tensors are\n'
+          'live per attention call under autograd. Treat as a relative ranking,\n'
+          'not a hard limit, and confirm with torch.cuda.max_memory_allocated().')
+
+if args.accum_check:
+    # Replays learn_edge.py's accumulation arithmetic to report true effective batch
+    # size and optimizer.step() count per epoch.
+    n_train = int(train_flag.sum())
+    print('\n### effective batch size (replaying learn_edge.py loop arithmetic) ###')
+    print(f'  train edges: {n_train:,}')
+    for bs in [4, 10, 20]:
+        for accum in (1, 10):
+            n_steps = micro = 0
+            for batch_start in range(1, n_train, bs):
+                batch_end = min(batch_start + bs, n_train)
+                micro += 1
+                idx = (batch_start - 1) // bs
+                if (idx + 1) % accum == 0 or batch_end >= n_train:
+                    n_steps += 1
+            print(f'  bs={bs:<3} accum_steps={accum:<3} -> effective batch '
+                  f'{bs * accum:<5} optimizer.step/epoch={n_steps:<6} '
+                  f'micro-batches/epoch={micro}')
+    print('\nnote: gradient accumulation does NOT reduce activation memory --\n'
+          'memory is set by --bs and --n_degree alone. --accum_steps only changes\n'
+          'how many micro-batches contribute to each optimizer update.')
 
 if args.real:
     print('\nnumerical smoke test (real attention math):')
