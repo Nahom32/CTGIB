@@ -249,9 +249,11 @@ for epoch in range(1, NUM_EPOCH+1):
 
         with autocast():
             pos_prob, neg_prob, info_loss = tgib(train_src_l, train_dst_l, i_emb_fake, train_ts_l, train_e_idx_l, batch_indices, epoch, training=True, num_neighbors=NUM_NEIGHBORS)
-            pos_labels = torch.ones(B, dtype=torch.float, device=device)
-            neg_labels = torch.zeros(B, dtype=torch.float, device=device)
-            loss = (criterion(pos_prob, pos_labels) + criterion(neg_prob, neg_labels) + info_loss) / ACCUM_STEPS
+
+        pos_labels = torch.ones(B, dtype=torch.float, device=device)
+        neg_labels = torch.zeros(B, dtype=torch.float, device=device)
+        with autocast(enabled=False):
+            loss = (criterion(pos_prob.float(), pos_labels) + criterion(neg_prob.float(), neg_labels) + info_loss.float()) / ACCUM_STEPS
 
         scaler.scale(loss).backward()
 
