@@ -3,3 +3,8 @@
 **/.DS_Store
 /venv/
 remaining-optimizations.md
+**/processed/
+**/saved_models/
+**/log/
+**/saved_checkpoints/
+
